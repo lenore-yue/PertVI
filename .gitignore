@@ -1,0 +1,52 @@
+# ==========================================
+# 1. Single-Cell & Raw Data
+# ==========================================
+# Never commit raw or processed datasets to Git. 
+*.h5ad
+*.h5
+*.csv
+*.tsv
+*.mtx
+data/
+datasets/
+
+# ==========================================
+# 2. PyTorch & scvi-tools Model Weights
+# ==========================================
+# These files are massive and will crash your repository.
+*.pt
+*.pth
+*.ckpt
+lightning_logs/
+wandb/
+models/
+
+# Ignore the specific model save folder you just created!
+trained_disentangled_mrvi/
+trained_*/
+
+# ==========================================
+# 3. Jupyter Notebooks & Cache
+# ==========================================
+# Ignores the hidden cache folders Jupyter creates.
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ==========================================
+# 4. Python Package & Environments
+# ==========================================
+# Ignores the artifacts created when you run `pip install -e .`
+*.egg-info/
+build/
+dist/
+venv/
+env/
+.env
+
+# ==========================================
+# 5. OS System Files
+# ==========================================
+.DS_Store
+Thumbs.db
