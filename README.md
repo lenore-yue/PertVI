@@ -1,4 +1,3 @@
-Markdown
 # PertVI: Conditional Perturbation Variational Inference
 
 PertVI is a deep generative model built on the `scvi-tools` framework, designed specifically to disentangle conditional drug responses and perturbation effects from intrinsic cellular biology in single-cell RNA-seq data.
