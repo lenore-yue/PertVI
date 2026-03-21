@@ -3,9 +3,9 @@ from scvi.data import AnnDataManager
 from scvi.data.fields import LayerField, CategoricalObsField, NumericalJointObsField
 from scvi.train import TrainRunner, TrainingPlan
 from scvi.dataloaders import DataSplitter
+from ._module import PertVIModule
 
-
-class DrVITrainingPlan(TrainingPlan):
+class PertVITrainingPlan(TrainingPlan):
     def __init__(
         self, 
         module, 
@@ -72,7 +72,7 @@ class DrVITrainingPlan(TrainingPlan):
         super().on_train_epoch_end()
 
 
-class DrVI(RNASeqMixin, VAEMixin, BaseModelClass):
+class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
     """
     Model for disentangling state-driven (cell cycle/differentiation) from 
     state-driving (OOD) perturbation effects.
@@ -88,7 +88,7 @@ class DrVI(RNASeqMixin, VAEMixin, BaseModelClass):
         super().__init__(adata)
         
         # Setup the scVI module
-        self.module = DisentangledMrVIModule(
+        self.module = PertVIModule(
             n_input=self.summary_stats.n_vars,
             n_batch=self.summary_stats.n_batch,
             n_samples=len(self.adata_manager.get_state_registry("sample").categorical_mapping),
@@ -179,7 +179,7 @@ class DrVI(RNASeqMixin, VAEMixin, BaseModelClass):
         )
 
         # 2. Instantiate our custom Lightning plan
-        training_plan = DrVITrainingPlan(
+        training_plan = PertVITrainingPlan(
             self.module,
             warmup_epochs=warmup_epochs,
             anneal_epochs=anneal_epochs,

@@ -4,10 +4,10 @@ from torch.autograd import Function
 from scvi.nn import Encoder, FCLayers
 
 # ==========================================
-# Disentangled MrVI Inference Architecture
+# Perturbation-specialized MrVI Inference Architecture
 # ==========================================
 
-class DisentangledMrVI_Inference(nn.Module):
+class PertVI_Inference(nn.Module):
     def __init__(
         self, 
         n_input, 

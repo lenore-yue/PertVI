@@ -5,8 +5,9 @@ from torch.distributions import kl_divergence as kl
 from scvi.module.base import BaseModuleClass, LossOutput, auto_move_data
 from scvi.nn import DecoderSCVI
 from scvi.distributions import NegativeBinomial
+from ._components import PertVI_Inference
 
-class DisentangledMrVIModule(BaseModuleClass):
+class PertVIModule(BaseModuleClass):
     def __init__(
         self,
         n_input,
@@ -22,7 +23,7 @@ class DisentangledMrVIModule(BaseModuleClass):
         super().__init__()
         self.n_latent_total = n_latent_cycle + n_latent_state + n_latent_ood
         
-        self.inference_net = DisentangledMrVI_Inference(
+        self.inference_net = PertVI_Inference(
             n_input=n_input,
             n_samples=n_samples,
             n_latent_cycle=n_latent_cycle,
