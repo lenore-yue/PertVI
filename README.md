@@ -19,7 +19,7 @@ The model utilizes a conditional Multi-Layer Perceptron (MLP) transition to calc
 You can install PertVI locally in editable mode. Ensure you have your `conda` environment activated with `scvi-tools` and `scanpy` installed.
 
 ```bash
-git clone [https://github.com/YOUR_USERNAME/PertVI.git](https://github.com/YOUR_USERNAME/PertVI.git)
+git clone [https://github.com/lenore-yue/PertVI.git](https://github.com/lenore-yue/PertVI.git)
 cd PertVI
 pip install -e .
 💻 Quickstart
