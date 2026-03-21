@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "drvi"
+name = "pertvi"
 version = "0.1.0"
-description = "DrVI: Disentangled Multi-resolution Variational Inference for Perturbation Analysis"
+description = "PertVI: Disentangled Multi-resolution Variational Inference for Perturbation Analysis"
 dependencies = [
     "torch>=2.0",
     "scvi-tools>=1.0",
