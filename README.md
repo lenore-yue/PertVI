@@ -22,8 +22,9 @@ You can install PertVI locally in editable mode. Ensure you have your `conda` en
 git clone [https://github.com/lenore-yue/PertVI.git](https://github.com/lenore-yue/PertVI.git)
 cd PertVI
 pip install -e .
-💻 Quickstart
-Python
+```
+## 💻 Quickstart
+```Python
 import scanpy as sc
 from pertvi import PertVI
 
@@ -48,5 +49,6 @@ latents = model.get_latent_representation()
 adata.obsm["X_u_cycle"] = latents["u_cycle"]
 adata.obsm["X_u_state"] = latents["u_state"]
 adata.obsm["X_v_ood"] = latents["v_ood"]
-📖 Citation
+```
+## 📖 Citation
 (Coming Soon)
