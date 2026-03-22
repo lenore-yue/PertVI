@@ -125,6 +125,7 @@ class PertVI_Inference(nn.Module):
             "q_m_cycle": q_m_cycle, "q_v_cycle": q_v_cycle,
             "q_m_state": q_m_state, "q_v_state": q_v_state,
             "q_m_ood": q_m_ood, "q_v_ood": q_v_ood,
+            "z_shift": z_shift, "z_base": z_base
             "z_final": z_final,
             "pred_cycle": pred_cycle,
             "q_m_lib": q_m_lib,

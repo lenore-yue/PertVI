@@ -1,3 +1,7 @@
+import torch
+import numpy as np
+import pandas as pd
+
 from scvi.model.base import BaseModelClass, RNASeqMixin, VAEMixin
 from scvi.data import AnnDataManager
 from scvi.data.fields import LayerField, CategoricalObsField, NumericalJointObsField
@@ -222,18 +226,24 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         )
         
         latent_spaces = {
-            "u_cycle": [], "u_state": [], "v_ood": [], "z_final": []
+            "u_cycle": [], "u_state": [], "v_ood": [], 
+            "z_shift": [], "z_base": [],"z_final": []
         }
         
         for tensors in scdl:
             inference_inputs = self.module._get_inference_input(tensors)
             outputs = self.module.inference(**inference_inputs)
-            
+
+            # u space (sample unaware)
             latent_spaces["u_cycle"].append(outputs["q_m_cycle"].cpu().numpy())
             latent_spaces["u_state"].append(outputs["q_m_state"].cpu().numpy())
+
+            # v space (OOD)
             latent_spaces["v_ood"].append(outputs["q_m_ood"].cpu().numpy())
             
-            # This is your combined, sample-aware space!
+            # z space (sample aware)
+            latent_spaces["z_shift"].append(outputs["z_shift"].cpu().numpy())
+            latent_spaces["z_base"].append(outputs["z_base"].cpu().numpy())
             latent_spaces["z_final"].append(outputs["z_final"].cpu().numpy())
 
         import numpy as np
