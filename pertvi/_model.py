@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import pandas as pd
+import scvi
 
 from scvi.model.base import BaseModelClass, RNASeqMixin, VAEMixin
 from scvi.data import AnnDataManager
@@ -252,40 +253,58 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             
         return latent_spaces
 
+    
     @torch.inference_mode()
     def get_normalized_expression(
         self,
         adata=None,
         indices=None,
-        batch_size=None,
-        target_sum=10000, # Standard scaling factor (like CPM)
+        transform_batch=None, # e.g., "Plate_1"
+        target_sum=10000,
+        batch_size=128,
     ):
-        """Returns the batch-corrected, denoised gene expression."""
+        """
+        Returns the denoised, batch-corrected normalized expression.
+        If transform_batch is provided, all cells are projected onto that single batch baseline.
+        """
         self._check_if_trained(warn=False)
         adata = self._validate_anndata(adata)
         scdl = self._make_data_loader(
             adata=adata, indices=indices, batch_size=batch_size
         )
         
+        # 1. Look up the integer ID for the target batch from the AnnData registry
+        target_batch_idx = None
+        if transform_batch is not None:
+            # Get the categorical mapping scvi-tools built during setup_anndata
+            batch_mapping = self.adata_manager.get_state_registry("batch").categorical_mapping
+            
+            if transform_batch not in batch_mapping:
+                raise ValueError(f"Batch '{transform_batch}' not found. Available batches: {batch_mapping}")
+                
+            # Find the integer that corresponds to your string label
+            target_batch_idx = np.where(batch_mapping == transform_batch)[0][0]
+
         exprs = []
-        
         for tensors in scdl:
-            # 1. Run inference to get the latent states
+            # 2. Swap the batch tensor if a target is provided!
+            if target_batch_idx is not None:
+                # Overwrite the batch ID for every cell in this mini-batch with the target ID
+                tensors[scvi.REGISTRY_KEYS.BATCH_KEY] = torch.full_like(
+                    tensors[scvi.REGISTRY_KEYS.BATCH_KEY], 
+                    target_batch_idx
+                )
+                
+            # 3. Run Inference (get latent states)
             inference_inputs = self.module._get_inference_input(tensors)
             inference_outputs = self.module.inference(**inference_inputs)
             
-            # 2. Feed the latent states into the generative decoder
+            # 4. Run Generative (decode back to expression)
             generative_inputs = self.module._get_generative_input(tensors, inference_outputs)
             generative_outputs = self.module.generative(**generative_inputs)
             
-            # 3. Extract px_scale (the denoised, batch-free relative frequencies)
-            px_scale = generative_outputs["px_scale"].cpu().numpy()
-            
-            # Scale to a target sum for easier interpretation 
-            exprs.append(px_scale * target_sum)
-
-        import numpy as np
-        import pandas as pd
+            # px_scale is the normalized mean of the negative binomial
+            exprs.append(generative_outputs["px_scale"].cpu().detach().numpy() * target_sum)
         
         # Concatenate and return as a DataFrame with gene names
         exprs_array = np.concatenate(exprs, axis=0)
