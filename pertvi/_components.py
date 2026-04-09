@@ -1,10 +1,45 @@
 import torch
 import torch.nn as nn
-from torch.autograd import Function
-from scvi.nn import Encoder, FCLayers
+from scvi.nn import Encoder
 
 # ==========================================
-# Perturbation-specialized MrVI Inference Architecture
+# FiLM transition block
+# ==========================================
+class SplitNaturalShiftFiLM(nn.Module):
+    def __init__(self, u_cycle_dim: int = 10, u_state_dim: int = 20, drug_embed_dim: int = 16):
+        super().__init__()
+        
+        # Cycle-Specific Modulators
+        self.gamma_cycle = nn.Linear(drug_embed_dim, u_cycle_dim)
+        self.beta_cycle = nn.Linear(drug_embed_dim, u_cycle_dim)
+        
+        # State-Specific Modulators
+        self.gamma_state = nn.Linear(drug_embed_dim, u_state_dim)
+        self.beta_state = nn.Linear(drug_embed_dim, u_state_dim)
+        
+        # Residual Initializations (1 + gamma) to prevent manifold erasure
+        nn.init.zeros_(self.gamma_cycle.weight); nn.init.zeros_(self.gamma_cycle.bias)
+        nn.init.zeros_(self.gamma_state.weight); nn.init.zeros_(self.gamma_state.bias)
+        
+        nn.init.zeros_(self.beta_cycle.weight); nn.init.zeros_(self.beta_cycle.bias)
+        nn.init.zeros_(self.beta_state.weight); nn.init.zeros_(self.beta_state.bias)
+        
+        self.norm_cycle = nn.LayerNorm(u_cycle_dim)
+        self.norm_state = nn.LayerNorm(u_state_dim)
+
+    def forward(self, u_cycle: torch.Tensor, u_state: torch.Tensor, drug_embedding: torch.Tensor):
+        # 1. Independent Cycle Shift
+        g_cyc, b_cyc = self.gamma_cycle(drug_embedding), self.beta_cycle(drug_embedding)
+        z_cycle = self.norm_cycle(((1.0 + g_cyc) * u_cycle) + b_cyc)
+        
+        # 2. Independent State Shift
+        g_st, b_st = self.gamma_state(drug_embedding), self.beta_state(drug_embedding)
+        z_state = self.norm_state(((1.0 + g_st) * u_state) + b_st)
+        
+        return z_cycle, z_state
+        
+# ==========================================
+# Perturbation-specialized Multi-resolution Varitional Inference Architecture
 # ==========================================
 
 class PertVI_Inference(nn.Module):
@@ -14,8 +49,8 @@ class PertVI_Inference(nn.Module):
         n_samples,
         n_latent_cycle=10, 
         n_latent_state=20, 
-        n_latent_ood=20,
-        n_cycle_targets=2
+        n_latent_ood=10, # Decreased from 20 to cap the OOD Black Hole
+        n_cycle_targets=2 # Will be removed in Phase 2
     ):
         super().__init__()
         
@@ -33,36 +68,8 @@ class PertVI_Inference(nn.Module):
             n_layers=2
         )
         self.sample_embedding = nn.Embedding(n_samples, 16)
-
-        # --- B. Encoders to learn library size ---
-        self.encoder_library = nn.Sequential(
-            nn.Linear(n_input, 128),
-            nn.ReLU(),
-            nn.BatchNorm1d(128),
-            nn.Linear(128, 2) 
-        )
         
-        # --- C. The Adversarial "Stick" ---
-        self.cycle_classifier = nn.Sequential(
-            nn.Linear(n_latent_cycle, 64),
-            nn.ReLU(),
-            nn.BatchNorm1d(64),
-            nn.Linear(64, n_cycle_targets)
-        )
-        
-        # --- D. The Sample-Aware (z) Transition Layer ---
-        # Takes the concatenated u-spaces. 
-        self.n_latent_u = n_latent_cycle + n_latent_state
-        
-        # Use a standard PyTorch Sequential block to avoid scvi-tools FCLayers quirks
-        self.z_transition = nn.Sequential(
-            nn.Linear(self.n_latent_u + 16, 128),
-            nn.ReLU(),
-            nn.BatchNorm1d(128),
-            nn.Linear(128, self.n_latent_u)
-        )
-        
-        # --- E. The OOD Escape Hatch (v_ood) ---
+        # --- B. The OOD Escape Hatch (v_ood) ---
         self.encoder_ood = Encoder(
             n_input=n_input,
             n_output=n_latent_ood,
@@ -70,62 +77,67 @@ class PertVI_Inference(nn.Module):
             n_layers=1
         )
 
+        # --- C. Encoders to learn library size ---
+        self.encoder_library = nn.Sequential(
+            nn.Linear(n_input, 128),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Linear(128, 2) 
+        )
+
+        # --- D. The Adversarial cell cycle classifier ---
+        self.cycle_classifier = nn.Sequential(
+            nn.Linear(n_latent_cycle, 64), nn.ReLU(), nn.BatchNorm1d(64), nn.Linear(64, n_cycle_targets)
+        )
+        
+        # --- E. The FiLM Transition ---
+        self.split_film_transition = SplitNaturalShiftFiLM(
+            u_cycle_dim=n_latent_cycle, 
+            u_state_dim=n_latent_state, 
+            drug_embed_dim=16
+        )
+
     def forward(self, x, sample_index):
         """
-        x: Raw counts tensor
+        x: Raw log-normalized counts tensor
         """
         
-        # 1. Extract Cell Cycle state
+        # Extract Latents
         q_m_cycle, q_v_cycle, u_cycle = self.encoder_cycle(x)
-        
-        # 2. Extract Intrinsic Biology (Cancer State / EMT / Metabolism)
         q_m_state, q_v_state, u_state = self.encoder_state(x)
-        
-        # 3. Extract the Out-of-Distribution shift
         q_m_ood, q_v_ood, v_ood = self.encoder_ood(x)
-        
-        # 4. Apply the Orthogonality Constraint
+
+        # Cell cycle prediction
         pred_cycle = self.cycle_classifier(u_cycle)
         
-        # 5. The Sample-Aware Space (z)
-        u_combined = torch.cat([u_cycle, u_state], dim=-1)
-        
-        # 6. Embed the sample and glue it to the biology
+        # FiLM Transition
         sample_embed = self.sample_embedding(sample_index.squeeze(-1).long())
-        u_and_sample = torch.cat([u_combined, sample_embed], dim=-1)
+        z_cycle, z_state = self.split_film_transition(u_cycle, u_state, sample_embed)
+        u_base = torch.cat([u_cycle, u_state], dim=-1)
+        z_base = torch.cat([z_cycle, z_state], dim=-1)
+
+        # Derive z shift
+        z_shift = z_base - u_base
         
-        # 7. Calculate the sample-specific shift and add it to the base biology
-        # This mirrors the true MrVI: z = u + f(u, s)
-        z_shift = self.z_transition(u_and_sample)
-        z_base = u_combined + z_shift 
-        
-        # 8. Final compositional mapping
+        # Final composition
         z_final = torch.cat([z_base, v_ood], dim=-1) 
 
-        # 9. Extract and Sample the Library Size
-        # Calculate the reality (empirical sum)
-        empirical_counts = torch.clamp(x.sum(dim=-1, keepdim=True), min=1.0)
+        # Library Size
+        empirical_counts = torch.clamp(x.sum(dim=-1, keepdim=True), min=1.0) # Calculate the reality (empirical sum)
         empirical_lib_log = torch.log(empirical_counts)
-        
-        # Let the network guess a small TWEAK, not the absolute number!
-        q_lib_params = self.encoder_library(x)
-        
-        # add the network's guess to the true empirical baseline
+        q_lib_params = self.encoder_library(x) # Let the network guess a small TWEAK, not the absolute number
         q_m_lib = empirical_lib_log + q_lib_params[:, 0:1] 
-        
-        # Tame the variance
-        q_v_lib_raw = torch.clamp(q_lib_params[:, 1:2], min=-5.0, max=2.0)
+        q_v_lib_raw = torch.clamp(q_lib_params[:, 1:2], min=-5.0, max=2.0) # Tame the variance
         q_v_lib = torch.exp(q_v_lib_raw) + 1e-4 
-        
-        # Sample the final latent library size
-        library_log = q_m_lib + torch.sqrt(q_v_lib) * torch.randn_like(q_m_lib)
+        library_log = q_m_lib + torch.sqrt(q_v_lib) * torch.randn_like(q_m_lib) # Sample the final latent library size
         
         return {
             "u_cycle": u_cycle, "u_state": u_state, "v_ood": v_ood,
             "q_m_cycle": q_m_cycle, "q_v_cycle": q_v_cycle,
             "q_m_state": q_m_state, "q_v_state": q_v_state,
             "q_m_ood": q_m_ood, "q_v_ood": q_v_ood,
-            "z_shift": z_shift, "z_base": z_base,
+            "u_base": u_base, "z_shift": z_shift, "z_base": z_base,
+            "z_cycle": z_cycle, "z_state": z_state,
             "z_final": z_final,
             "pred_cycle": pred_cycle,
             "q_m_lib": q_m_lib,
