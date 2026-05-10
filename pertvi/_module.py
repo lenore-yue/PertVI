@@ -4,22 +4,21 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 from torch.distributions import kl_divergence as kl
 from scvi.module.base import BaseModuleClass, LossOutput, auto_move_data
-from scvi.nn import DecoderSCVI
 from scvi.distributions import NegativeBinomial
-from ._components import PertVI_Inference
+from ._components import PertVI_Inference, BifurcatedDecoder
 
 
 class PertVIModule(BaseModuleClass):
     def __init__(
         self,
         n_input,
+        cycle_gene_mask,
         n_samples=0,
         n_batch=0,
         n_labels=0,
         n_latent_cycle=10,
         n_latent_state=20,
         n_latent_ood=10, # Reduced capacity for OOD bottleneck
-        n_cycle_targets=2,
         drug_embed_dim=16, # Added embedding dimension
         **kwargs
     ):
@@ -31,16 +30,17 @@ class PertVIModule(BaseModuleClass):
             n_samples=n_samples,
             n_latent_cycle=n_latent_cycle,
             n_latent_state=n_latent_state,
-            n_latent_ood=n_latent_ood,
-            n_cycle_targets=n_cycle_targets
+            n_latent_ood=n_latent_ood
         )
-
-        # Standard initialization (Will be replaced by Bifurcated Decoder in Phase 2)
-        self.generative_net = DecoderSCVI(
-            n_input=self.n_latent_total,
-            n_output=n_input,
+        
+        # use custom bifurcated decoder
+        self.generative_net = BifurcatedDecoder(
+            n_input=self.n_latent_total, 
+            n_output=n_input, 
+            n_latent_cycle=n_latent_cycle,
+            cycle_gene_mask=cycle_gene_mask, 
             n_cat_list=[n_batch] if n_batch > 0 else None,
-            n_layers=1,
+            n_layers=1, 
             n_hidden=128
         )
         
@@ -99,11 +99,7 @@ class PertVIModule(BaseModuleClass):
         
         # 1. Unpack Tensors & Clamp
         x = tensors["X"]
-        x_safe = torch.clamp(x, min=0.0)
-        
-        cycle_targets = tensors["cell_cycle_scores"] 
-        cycle_targets = torch.nan_to_num(cycle_targets, nan=0.0)
-        
+        x_safe = torch.clamp(x, min=0.0)        
         is_treated = tensors.get("is_treated", torch.ones(x.shape[0], 1, device=x.device))
         
         # 2. Unpack Inference & Generative Outputs
@@ -114,7 +110,6 @@ class PertVIModule(BaseModuleClass):
         
         u_cycle = inference_outputs["u_cycle"]
         u_state = inference_outputs["u_state"]
-        pred_cycle = inference_outputs["pred_cycle"]
         
         px_rate = generative_outputs["px_rate"]
         
@@ -130,7 +125,8 @@ class PertVIModule(BaseModuleClass):
         
         # Symmetric KL for OOD
         kl_ood_var = kl(Normal(torch.zeros_like(q_m_ood), torch.sqrt(q_v_ood)), prior).sum(dim=-1)
-        
+
+        # KL for library size
         empirical_counts = torch.clamp(x_safe.sum(dim=-1, keepdim=True), min=1.0)
         empirical_library_log = torch.log(empirical_counts).detach() 
         
@@ -139,32 +135,59 @@ class PertVIModule(BaseModuleClass):
         
         kl_local_unaggregated = kl_cycle + kl_state + kl_ood_var + kl_library
 
-        # 4. Custom Disentanglement Penalties
-        cycle_loss = F.mse_loss(pred_cycle, cycle_targets, reduction="none").sum(dim=-1)
-
+        # 4. Orthogonality constraint between state/ood and cycle
         u_cycle_c = u_cycle - u_cycle.mean(dim=0)
         u_state_c = u_state - u_state.mean(dim=0)
         
         cov_matrix = torch.matmul(u_state_c.t(), u_cycle_c) / (u_cycle.shape[0] - 1 + 1e-8)
-        disentangle_loss_scalar = torch.sum(cov_matrix ** 2)
+        disentangle_state_cycle = torch.sum(cov_matrix ** 2)
 
-        # UPDATED: OOD Leakage Constraint applied strictly to the predicted MEAN (q_m_ood)
+        # NEW: OOD-Cycle Orthogonalization
+        treated_mask = is_treated.squeeze().bool()
+        
+        # Only calculate if we have enough treated cells in the minibatch to form a covariance matrix
+        if treated_mask.sum() > 1: 
+            u_cycle_treated = u_cycle[treated_mask]
+            q_m_ood_treated = q_m_ood[treated_mask]
+            
+            u_cyc_t_c = u_cycle_treated - u_cycle_treated.mean(dim=0)
+            q_m_ood_t_c = q_m_ood_treated - q_m_ood_treated.mean(dim=0)
+            
+            cov_matrix_ood = torch.matmul(q_m_ood_t_c.t(), u_cyc_t_c) / (u_cyc_t_c.shape[0] - 1 + 1e-8)
+            disentangle_ood_cycle = torch.sum(cov_matrix_ood ** 2)
+        else:
+            disentangle_ood_cycle = torch.tensor(0.0, device=x.device)
+
+        # OOD Masked L1
         control_mask = (1.0 - is_treated.view(-1, 1))
-        ood_leakage_loss = torch.sum((q_m_ood * control_mask) ** 2, dim=-1)
+        ood_leakage_loss = torch.sum(torch.abs(q_m_ood * control_mask), dim=-1) ## switched to L1 penalty
 
-        # 5. Dynamic Weighting & Aggregation
+        # 5. Soft L1 Penalty Mask on Main Head
+        # Extract weights connecting to cycle genes from the main head
+        cycle_mask_bool = self.generative_net.cycle_gene_mask.bool()
+        main_head_cycle_weights = self.generative_net.main_head.weight[cycle_mask_bool]
+        soft_l1_loss = torch.sum(torch.abs(main_head_cycle_weights))
+        
+        # 6. Dynamic Weighting & Aggregation
         lambda_kl = 1.0
-        lambda_adv = getattr(self, "current_lambda_adv", 0.0)
-        lambda_ood = getattr(self, "current_lambda_ood", 0.0)
+        lambda_adv_state = getattr(self, "current_lambda_adv_state", 100.0)
+        lambda_adv_ood = getattr(self, "current_lambda_adv_ood", 5.0)
+        lambda_ood = getattr(self, "current_lambda_ood", 50.0)
+        lambda_soft = 50.0 # 5 -> 50 to protect main decoder from cell cycle genes
 
+        # base loss
         base_loss_unaggregated = (
-            reconst_loss 
-            + (lambda_kl * kl_local_unaggregated) 
-            + (10.0 * cycle_loss) 
-            + (lambda_ood * ood_leakage_loss)
+            reconst_loss + (lambda_kl * kl_local_unaggregated) + 
+            (lambda_ood * ood_leakage_loss)
         )
-
-        total_loss = torch.mean(base_loss_unaggregated) + (lambda_adv * disentangle_loss_scalar)
+        
+        # Add scalar penalties (Soft L1 and Covariance) to the final objective
+        total_loss = (
+            torch.mean(base_loss_unaggregated) + 
+            (lambda_adv_state * disentangle_state_cycle) + 
+            (lambda_adv_ood * disentangle_ood_cycle) + 
+            (lambda_soft * soft_l1_loss)
+        )
 
         # 6. Output
         return LossOutput(
@@ -173,10 +196,10 @@ class PertVIModule(BaseModuleClass):
             kl_local=kl_local_unaggregated,         
             n_obs_minibatch=x.shape[0],             
             extra_metrics={
-                "cycle_prediction_loss": torch.mean(cycle_loss),
-                "covariance_penalty": disentangle_loss_scalar,
+                "covariance_penalty_state": disentangle_state_cycle,
+                "covariance_penalty_ood": disentangle_ood_cycle,
                 "ood_leakage_penalty": torch.mean(ood_leakage_loss),
+                "soft_l1_penalty": soft_l1_loss,
                 "v_ood_active_fraction": torch.mean((torch.abs(q_m_ood) > 0.5).float()),
-                "kl_library": torch.mean(kl_library)
             }
         )

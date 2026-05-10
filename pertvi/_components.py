@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from scvi.nn import Encoder
 
 # ==========================================
@@ -28,16 +29,85 @@ class SplitNaturalShiftFiLM(nn.Module):
         self.norm_state = nn.LayerNorm(u_state_dim)
 
     def forward(self, u_cycle: torch.Tensor, u_state: torch.Tensor, drug_embedding: torch.Tensor):
-        # 1. Independent Cycle Shift
-        g_cyc, b_cyc = self.gamma_cycle(drug_embedding), self.beta_cycle(drug_embedding)
-        z_cycle = self.norm_cycle(((1.0 + g_cyc) * u_cycle) + b_cyc)
+        # Normalize the base manifolds FIRST
+        u_cycle_norm = self.norm_cycle(u_cycle)
+        u_state_norm = self.norm_state(u_state)
         
-        # 2. Independent State Shift
+        # Calculate Independent Modulators
+        g_cyc, b_cyc = self.gamma_cycle(drug_embedding), self.beta_cycle(drug_embedding)
         g_st, b_st = self.gamma_state(drug_embedding), self.beta_state(drug_embedding)
-        z_state = self.norm_state(((1.0 + g_st) * u_state) + b_st)
+        
+        # Apply the Momentum Shift AFTER normalization
+        z_cycle = ((1.0 + g_cyc) * u_cycle_norm) + b_cyc
+        z_state = ((1.0 + g_st) * u_state_norm) + b_st
         
         return z_cycle, z_state
+
+# ==========================================
+# Bifurcated decoder: cell cycle head + main head 
+# ==========================================
+
+class BifurcatedDecoder(nn.Module):
+    def __init__(
+        self, n_input: int, n_output: int, n_latent_cycle: int, 
+        cycle_gene_mask: torch.Tensor, n_cat_list: list = None, n_hidden: int = 128, n_layers: int = 1
+    ):
+        super().__init__()
+        self.n_latent_cycle = n_latent_cycle
+        self.n_latent_main = n_input - n_latent_cycle
+        self.n_genes = n_output
+        self.register_buffer("cycle_gene_mask", cycle_gene_mask.float())
         
+        # Pathway A: Strictly Linear Cycle Head
+        self.cycle_head = nn.Linear(self.n_latent_cycle, self.n_genes)
+        
+        # Pathway B: Dense Main Head & Batch Bypass
+        self.use_batch = n_cat_list is not None and len(n_cat_list) > 0
+        if self.use_batch:
+            self.batch_embed = nn.Embedding(n_cat_list[0], 16)
+            main_in_dim = self.n_latent_main + 16
+            self.batch_gene_bias = nn.Linear(16, self.n_genes) # Batch bypass for cycle genes
+        else:
+            main_in_dim = self.n_latent_main
+
+        layers = []
+        for _ in range(n_layers):
+            layers.append(nn.Linear(main_in_dim, n_hidden))
+            layers.append(nn.BatchNorm1d(n_hidden))
+            layers.append(nn.ReLU())
+            main_in_dim = n_hidden
+            
+        self.main_hidden = nn.Sequential(*layers)
+        self.main_head = nn.Linear(n_hidden, self.n_genes)
+        self.px_dropout_decoder = nn.Linear(n_hidden, self.n_genes)
+
+    def forward(self, dispersion: str, z: torch.Tensor, library: torch.Tensor, batch_index: torch.Tensor = None):
+        z_cycle = z[:, :self.n_latent_cycle]
+        z_main = z[:, self.n_latent_cycle:]
+        
+        if self.use_batch and batch_index is not None:
+            b_embed = self.batch_embed(batch_index.squeeze(-1))
+            z_main = torch.cat([z_main, b_embed], dim=-1)
+            h_batch = self.batch_gene_bias(b_embed)
+        else:
+            h_batch = 0.0
+            
+        # Hard Mask implementation
+        masked_cycle_weight = self.cycle_head.weight * self.cycle_gene_mask.unsqueeze(1)
+        masked_cycle_bias = self.cycle_head.bias * self.cycle_gene_mask
+        h_cycle = F.linear(z_cycle, masked_cycle_weight, masked_cycle_bias)
+        
+        h_hidden = self.main_hidden(z_main)
+        h_main = self.main_head(h_hidden)
+        
+        h_total = h_cycle + h_main + h_batch
+        
+        px_scale = F.softmax(h_total, dim=-1)
+        px_rate = torch.exp(library) * px_scale
+        px_dropout = self.px_dropout_decoder(h_hidden)
+        
+        return px_scale, None, px_rate, px_dropout
+
 # ==========================================
 # Perturbation-specialized Multi-resolution Varitional Inference Architecture
 # ==========================================
@@ -84,13 +154,8 @@ class PertVI_Inference(nn.Module):
             nn.BatchNorm1d(128),
             nn.Linear(128, 2) 
         )
-
-        # --- D. The Adversarial cell cycle classifier ---
-        self.cycle_classifier = nn.Sequential(
-            nn.Linear(n_latent_cycle, 64), nn.ReLU(), nn.BatchNorm1d(64), nn.Linear(64, n_cycle_targets)
-        )
         
-        # --- E. The FiLM Transition ---
+        # --- D. The FiLM Transition ---
         self.split_film_transition = SplitNaturalShiftFiLM(
             u_cycle_dim=n_latent_cycle, 
             u_state_dim=n_latent_state, 
@@ -106,9 +171,6 @@ class PertVI_Inference(nn.Module):
         q_m_cycle, q_v_cycle, u_cycle = self.encoder_cycle(x)
         q_m_state, q_v_state, u_state = self.encoder_state(x)
         q_m_ood, q_v_ood, v_ood = self.encoder_ood(x)
-
-        # Cell cycle prediction
-        pred_cycle = self.cycle_classifier(u_cycle)
         
         # FiLM Transition
         sample_embed = self.sample_embedding(sample_index.squeeze(-1).long())
@@ -139,7 +201,6 @@ class PertVI_Inference(nn.Module):
             "u_base": u_base, "z_shift": z_shift, "z_base": z_base,
             "z_cycle": z_cycle, "z_state": z_state,
             "z_final": z_final,
-            "pred_cycle": pred_cycle,
             "q_m_lib": q_m_lib,
             "q_v_lib": q_v_lib,
             "library_log": library_log
