@@ -9,6 +9,10 @@ from scvi.nn import Encoder
 class SplitNaturalShiftFiLM(nn.Module):
     def __init__(self, u_cycle_dim: int = 10, u_state_dim: int = 20, drug_embed_dim: int = 16):
         super().__init__()
+
+        # Layer-Norm for u_cycle and u_state
+        self.norm_cycle = nn.LayerNorm(u_cycle_dim)
+        self.norm_state = nn.LayerNorm(u_state_dim)
         
         # Cycle-Specific Modulators
         self.gamma_cycle = nn.Linear(drug_embed_dim, u_cycle_dim)
@@ -25,8 +29,6 @@ class SplitNaturalShiftFiLM(nn.Module):
         nn.init.zeros_(self.beta_cycle.weight); nn.init.zeros_(self.beta_cycle.bias)
         nn.init.zeros_(self.beta_state.weight); nn.init.zeros_(self.beta_state.bias)
         
-        self.norm_cycle = nn.LayerNorm(u_cycle_dim)
-        self.norm_state = nn.LayerNorm(u_state_dim)
 
     def forward(self, u_cycle: torch.Tensor, u_state: torch.Tensor, drug_embedding: torch.Tensor):
         # Normalize the base manifolds FIRST
@@ -117,14 +119,14 @@ class PertVI_Inference(nn.Module):
         self, 
         n_input, 
         n_samples,
-        n_latent_cycle=10, 
+        n_latent_cycle=3, 
         n_latent_state=20, 
-        n_latent_ood=10, # Decreased from 20 to cap the OOD Black Hole
-        n_cycle_targets=2 # Will be removed in Phase 2
+        n_latent_ood=10,
+        ood_dropout_rate=0.3
     ):
         super().__init__()
         
-        # --- A. Dual Encoders for Sample-Unaware (u) Spaces ---
+        # --- Dual Encoders for Sample-Unaware (u) Spaces ---
         self.encoder_cycle = Encoder(
             n_input=n_input, 
             n_output=n_latent_cycle, 
@@ -139,7 +141,7 @@ class PertVI_Inference(nn.Module):
         )
         self.sample_embedding = nn.Embedding(n_samples, 16)
         
-        # --- B. The OOD Escape Hatch (v_ood) ---
+        # --- The OOD Escape Hatch (v_ood) ---
         self.encoder_ood = Encoder(
             n_input=n_input,
             n_output=n_latent_ood,
@@ -147,7 +149,7 @@ class PertVI_Inference(nn.Module):
             n_layers=1
         )
 
-        # --- C. Encoders to learn library size ---
+        # --- Encoders to learn library size ---
         self.encoder_library = nn.Sequential(
             nn.Linear(n_input, 128),
             nn.ReLU(),
@@ -155,12 +157,15 @@ class PertVI_Inference(nn.Module):
             nn.Linear(128, 2) 
         )
         
-        # --- D. The FiLM Transition ---
+        # --- The FiLM Transition ---
         self.split_film_transition = SplitNaturalShiftFiLM(
             u_cycle_dim=n_latent_cycle, 
             u_state_dim=n_latent_state, 
             drug_embed_dim=16
         )
+
+        # --- The OOD dropout ---
+        self.ood_dropout = nn.Dropout(ood_dropout_rate)
 
     def forward(self, x, sample_index):
         """
@@ -180,6 +185,9 @@ class PertVI_Inference(nn.Module):
 
         # Derive z shift
         z_shift = z_base - u_base
+
+        # Composition with Information Dropout on OOD
+        v_ood_dropped = self.ood_dropout(v_ood)
         
         # Final composition
         z_final = torch.cat([z_base, v_ood], dim=-1) 

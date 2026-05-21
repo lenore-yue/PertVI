@@ -14,9 +14,10 @@ class PertVITrainingPlan(TrainingPlan):
     def __init__(
         self, 
         module, 
-        max_lambda_adv_state=100.0,  # renamed state orth penalty
-        max_lambda_adv_ood=5.0, # new ood orth penalty
-        max_lambda_ood=50.0,
+        max_lambda_adv_state=100.0,  # Heavy penalty for State vs Cycle
+        max_lambda_adv_ood=5.0,      # Gentle penalty for OOD vs Cycle
+        max_lambda_ood=50.0,         # Max penalty for OOD leakage
+        floor_lambda_ood=5.0,        # Floor penalty to prevent garbage dump
         warmup_epochs=50,
         anneal_epochs=100,
         **kwargs
@@ -25,10 +26,12 @@ class PertVITrainingPlan(TrainingPlan):
         self.max_lambda_adv_state = max_lambda_adv_state
         self.max_lambda_adv_ood = max_lambda_adv_ood
         self.max_lambda_ood = max_lambda_ood
+        self.floor_lambda_ood = floor_lambda_ood
         self.warmup_epochs = warmup_epochs
         self.anneal_epochs = anneal_epochs
 
-    def _compute_scheduled_weight(self, max_weight):
+    def _compute_standard_weight(self, max_weight):
+        """Standard annealing: 0.0 -> max_weight for covariance penalties."""
         epoch = self.current_epoch
         if epoch < self.warmup_epochs:
             return 0.0
@@ -38,22 +41,36 @@ class PertVITrainingPlan(TrainingPlan):
         else:
             return max_weight
 
+    def _compute_floor_weight(self, floor_weight, max_weight):
+        """Floor annealing: floor_weight -> max_weight for the OOD L1 penalty."""
+        epoch = self.current_epoch
+        if epoch < self.warmup_epochs:
+            return floor_weight
+        elif epoch < self.warmup_epochs + self.anneal_epochs:
+            progress = (epoch - self.warmup_epochs) / self.anneal_epochs
+            # Linearly interpolate between floor and max
+            return floor_weight + (max_weight - floor_weight) * progress
+        else:
+            return max_weight
+
     def training_step(self, batch, batch_idx):
-        # 1. Calculate weights
-        current_lambda_adv_state = self._compute_scheduled_weight(self.max_lambda_adv_state)
-        current_lambda_adv_ood = self._compute_scheduled_weight(self.max_lambda_adv_ood)
-        current_lambda_ood = self._compute_scheduled_weight(self.max_lambda_ood) # roll back: OOD is also annealed
+        # Calculate dynamically scheduled weights
+        current_lambda_adv_state = self._compute_standard_weight(self.max_lambda_adv_state)
+        current_lambda_adv_ood = self._compute_standard_weight(self.max_lambda_adv_ood)
+        current_lambda_ood = self._compute_floor_weight(self.floor_lambda_ood, self.max_lambda_ood)
         
-        # 2. Inject into module
+        # Inject weights directly into the module for the loss function
         self.module.current_lambda_adv_state = current_lambda_adv_state
         self.module.current_lambda_adv_ood = current_lambda_adv_ood
         self.module.current_lambda_ood = current_lambda_ood
-        # self.module.current_lambda_ood = self.max_lambda_ood # full force from Epoch 0
 
+        # 3. Proceed with standard forward pass and loss calculation
         return super().training_step(batch, batch_idx)
         
     def on_train_epoch_end(self):
+        # Log the dynamic weights so we can track them in TensorBoard/W&B
         self.log("lambda_adv_state", self.module.current_lambda_adv_state, on_epoch=True, prog_bar=False)
+        self.log("lambda_adv_ood", self.module.current_lambda_adv_ood, on_epoch=True, prog_bar=False)
         self.log("lambda_ood", self.module.current_lambda_ood, on_epoch=True, prog_bar=False)
         super().on_train_epoch_end()
 
@@ -62,15 +79,15 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
     def __init__(
         self,
         adata,
-        n_latent_cycle=10,
-        n_latent_state=20,
-        n_latent_ood=10, # PHASE 2 FIX: Dropped to 10 for bottleneck
-        cycle_gene_mask_key="is_cycle_gene", # PHASE 2 FIX: Ask for the mask
+        n_latent_cycle=3,
+        n_latent_state=30,
+        n_latent_ood=10, 
+        cycle_gene_mask_key="is_cycle_gene",
         **model_kwargs
     ):
         super().__init__(adata)
         
-        # PHASE 2 FIX: Extract the boolean mask from AnnData
+        # Extract the boolean mask from AnnData
         if cycle_gene_mask_key not in adata.var.columns:
             raise ValueError(f"Column '{cycle_gene_mask_key}' not found in adata.var.")
         
@@ -118,10 +135,11 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         max_epochs=400,
         warmup_epochs=50,
         anneal_epochs=100,
-        max_lambda_adv_state=50.0,
+        max_lambda_adv_state=100.0,
         max_lambda_adv_ood=5.0,
         max_lambda_ood=50.0,
-        train_size=0.9,
+        floor_lambda_ood=5.0,
+        train_size=0.8,
         validation_size=None,
         batch_size=256,
         use_gpu=True,
@@ -156,6 +174,7 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             max_lambda_adv_state=max_lambda_adv_state,
             max_lambda_adv_ood=max_lambda_adv_ood,
             max_lambda_ood=max_lambda_ood,
+            floor_lambda_ood=floor_lambda_ood,
             **plan_kwargs
         )
         
@@ -189,7 +208,7 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             adata=adata, indices=indices, batch_size=batch_size
         )
         
-        # PHASE 2 FIX: Added z_cycle and z_state extractors
+        # Added z_cycle and z_state extractors
         latent_spaces = {
             "u_cycle": [], "u_state": [], "v_ood": [], 
             "z_cycle": [], "z_state": [],
@@ -217,32 +236,51 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
 
     @torch.inference_mode()
     def get_normalized_expression(
-        self,
-        adata=None,
-        indices=None,
-        transform_batch=None,
-        target_sum=10000,
-        batch_size=128,
+        self, 
+        adata=None, 
+        indices=None, 
+        transform_batch=None, 
+        transform_sample=None, 
+        target_sum=10000, 
+        batch_size=128
     ):
+        """
+        Generates denoised / counterfactual expression.
+        Use transform_batch to harmonize technical noise.
+        Use transform_sample to generate counterfactual drug responses.
+        """
         self._check_if_trained(warn=False)
         adata = self._validate_anndata(adata)
-        scdl = self._make_data_loader(
-            adata=adata, indices=indices, batch_size=batch_size
-        )
+        scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
         
+        # Batch Registry Lookup
         target_batch_idx = None
         if transform_batch is not None:
             batch_mapping = self.adata_manager.get_state_registry("batch").categorical_mapping
             if transform_batch not in batch_mapping:
-                raise ValueError(f"Batch '{transform_batch}' not found. Available batches: {batch_mapping}")
+                raise ValueError(f"Batch '{transform_batch}' not found.")
             target_batch_idx = np.where(batch_mapping == transform_batch)[0][0]
+
+        # Sample (Perturbation) Registry Lookup
+        target_sample_idx = None
+        if transform_sample is not None:
+            sample_mapping = self.adata_manager.get_state_registry("sample").categorical_mapping
+            if transform_sample not in sample_mapping:
+                raise ValueError(f"Sample '{transform_sample}' not found.")
+            target_sample_idx = np.where(sample_mapping == transform_sample)[0][0]
 
         exprs = []
         for tensors in scdl:
+            # Overwrite batch tensor for denoising
             if target_batch_idx is not None:
                 tensors[scvi.REGISTRY_KEYS.BATCH_KEY] = torch.full_like(
-                    tensors[scvi.REGISTRY_KEYS.BATCH_KEY], 
-                    target_batch_idx
+                    tensors[scvi.REGISTRY_KEYS.BATCH_KEY], target_batch_idx
+                )
+            
+            # Overwrite sample tensor for counterfactual generation
+            if target_sample_idx is not None:
+                tensors["sample"] = torch.full_like(
+                    tensors["sample"], target_sample_idx
                 )
                 
             inference_inputs = self.module._get_inference_input(tensors)
@@ -250,11 +288,7 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             generative_inputs = self.module._get_generative_input(tensors, inference_outputs)
             generative_outputs = self.module.generative(**generative_inputs)
             
-            exprs.append(generative_outputs["px_scale"].cpu().detach().numpy() * target_sum)
+            exprs.append(generative_outputs["px_scale"].cpu().numpy() * target_sum)
         
         exprs_array = np.concatenate(exprs, axis=0)
-        return pd.DataFrame(
-            exprs_array, 
-            index=adata.obs_names, 
-            columns=adata.var_names
-        )
+        return pd.DataFrame(exprs_array, index=adata.obs_names, columns=adata.var_names)
