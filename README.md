@@ -411,14 +411,5 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{NB}} + \beta_{\text{cyc}}\text
 
 ## 📖 Citation
 
-If you use PertVI in your research, please cite:
+TBD
 
-```bibtex
-@article{yue2025pertvi,
-  title={Disentangling Single-Cell Perturbation Responses from Intrinsic Cellular Dynamics via Multi-Resolution Variational Inference},
-  author={Yue, Lenore and DeepMind Single-Cell Genomics Team},
-  journal={bioRxiv},
-  year={2025},
-  publisher={Cold Spring Harbor Laboratory}
-}
-```
