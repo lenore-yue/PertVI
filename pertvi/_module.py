@@ -144,22 +144,24 @@ class PertVIModule(BaseModuleClass):
         kl_local_unaggregated = (beta_cyc * kl_cycle) + kl_state + kl_ood_final + kl_library
 
         # --- Orthogonality constraints ---
-        u_cycle_c = u_cycle - u_cycle.mean(dim=0)
-        u_state_c = u_state - u_state.mean(dim=0)
+        # Compute covariance STRICTLY on the predicted means to eliminate stochastic jitter
+        q_m_cycle_c = q_m_cycle - q_m_cycle.mean(dim=0)
+        q_m_state_c = q_m_state - q_m_state.mean(dim=0)
         
         # State-Cycle
-        cov_matrix_state_cycle = torch.matmul(u_state_c.t(), u_cycle_c) / (u_cycle.shape[0] - 1 + 1e-8)
+        cov_matrix_state_cycle = torch.matmul(q_m_state_c.t(), q_m_cycle_c) / (q_m_cycle.shape[0] - 1 + 1e-8)
         disentangle_state_cycle = torch.sum(cov_matrix_state_cycle ** 2)
 
         # OOD shielded constraints (Only on treated cells)
         treated_mask = is_treated.squeeze().bool()
         if treated_mask.sum() > 1: 
-            u_cycle_treated = u_cycle[treated_mask]
-            u_state_treated = u_state[treated_mask]
+            # Use the means for the shielded covariance as well
+            q_m_cycle_treated = q_m_cycle[treated_mask]
+            q_m_state_treated = q_m_state[treated_mask]
             q_m_ood_treated = q_m_ood[treated_mask]
             
-            u_cyc_t_c = u_cycle_treated - u_cycle_treated.mean(dim=0)
-            u_st_t_c = u_state_treated - u_state_treated.mean(dim=0)
+            u_cyc_t_c = q_m_cycle_treated - q_m_cycle_treated.mean(dim=0)
+            u_st_t_c = q_m_state_treated - q_m_state_treated.mean(dim=0)
             q_m_ood_t_c = q_m_ood_treated - q_m_ood_treated.mean(dim=0)
             
             # OOD-Cycle
@@ -173,7 +175,7 @@ class PertVIModule(BaseModuleClass):
             disentangle_ood_cycle = torch.tensor(0.0, device=x.device)
             disentangle_ood_state = torch.tensor(0.0, device=x.device)
 
-        # --- Dual-Tiered L1 Sparsity ---
+        # --- Single-Tiered L1 Sparsity ---
         control_mask_2d = (1.0 - is_treated.view(-1, 1))
         
         # Crush controls to absolute zero
