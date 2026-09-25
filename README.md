@@ -9,9 +9,9 @@
 **PertVI** is a deep generative model built on `scvi-tools` designed specifically to disentangle conditional drug responses and genetic perturbation effects from intrinsic cell cycle dynamics and biological differentiation baselines in single-cell RNA-seq and Perturb-seq data.
 
 Unlike general-purpose single-cell models, PertVI uses a hypothesis-driven, constrained architecture featuring **Split-Natural FiLM transitions**, a **bifurcated decoder head**, and **deterministic covariance orthogonality penalties**. It enables:
-1. **Cell-Cycle Scrubbed States ($u_{\text{state}}$):** Isolates cellular differentiation, cancer state transitions, and metabolic baselines, completely cleaned of cell cycle confounding.
-2. **Dedicated Cell-Cycle Manifolds ($u_{\text{cycle}}$):** Preserves continuous closed-loop cycle kinetics ($G_1 \to S \to G_2/M$) via hard gene masking and topological prior relaxation.
-3. **Shielded Out-of-Distribution Bottlenecks ($v_{\text{ood}}$):** Captures rare, unexpected, or extreme perturbation-induced variance while strictly anchored to zero on control cells.
+1. **Cell-Cycle Scrubbed States (`u_state`):** Isolates cellular differentiation, cancer state transitions, and metabolic baselines, completely cleaned of cell cycle confounding.
+2. **Dedicated Cell-Cycle Manifolds (`u_cycle`):** Preserves continuous closed-loop cycle kinetics (G1 -> S -> G2/M) via hard gene masking and topological prior relaxation.
+3. **Shielded Out-of-Distribution Bottlenecks (`v_ood`):** Captures rare, unexpected, or extreme perturbation-induced variance while strictly anchored to zero on control cells.
 4. **Counterfactual Causal Scores (Coupled-CCS vs. State-CCS):** Quantifies true causal intervention effects by pushing shifted control manifolds through generative decoders.
 5. **Path-Integrated Perturbation Momentum:** Calculates the average causal transcriptional drive along continuous developmental or activation trajectories, accelerated **>900×** via linear hidden-space operator factorization.
 
@@ -220,17 +220,22 @@ PertVI offers a specialized downstream suite for perturbation genomics. Select t
 
 | Metric | API Function | Mathematical Concept | Biological Application |
 | :--- | :--- | :--- | :--- |
-| **ELSD** (Empirical Latent State Displacement) | `compute_elsd` | $d_p(c) = \mathbb{E}_{p, c}[u] - \mathbb{E}_{\text{ctrl}, c}[u]$ | Rapid exploratory screening, coarse compound clustering in latent space. |
-| **Coupled-CCS** (Causal Pushforward w/ FiLM) | `compute_ccs(inject_film=True)` | $W_{\text{head}} \mathbb{E}[h((1+\gamma_p)u_{\text{cf}} + \beta_p) - h(z_{\text{ctrl}})]$ | **Primary metric**: total causal drug response (latent transition + drug FiLM modulation). |
-| **State-CCS** (Pure State Pushforward) | `compute_ccs(inject_film=False)` | $W_{\text{head}} \mathbb{E}[h((1+\gamma_{\text{ctrl}})u_{\text{cf}} + \beta_{\text{ctrl}}) - h(z_{\text{ctrl}})]$ | Isolates pure differentiation/state shift, decoupled from chemical stress or off-target toxicity. |
-| **Linear Momentum** (Algorithm A, default) | `compute_momentum_score(style="linear")` | Factored path integral along straight centroid line $u_{\text{start}} \to u_{\text{end}}$ | Quantifies average perturbation drive across discrete states (e.g. Rest $\to$ Stimulated). |
-| **Trajectory Momentum** (Algorithms C & D) | `compute_momentum_score(style="trajectory-waypoint")` | Factored integration along pseudotime-ordered waypoints in target condition | Captures state-dependent kinetics, transition stalls, and developmental branch shifts. |
-| **Trajectory Decomposition** | `compute_momentum_score(return_decomposition=True)` | Returns: Mean Drive (`gene`), Trajectory Interaction Variance (`tiv`), Landmark Divergence (`ld`) | Detects **state-gated regulators** (perturbations whose causal effect is unlocked only at specific developmental stages). |
+| **ELSD** (Empirical Latent State Displacement) | `compute_elsd` | `d_p(c) = E[u_p] - E[u_ctrl]` | Rapid exploratory screening, coarse compound clustering in latent space. |
+| **Coupled-CCS** (Causal Pushforward w/ FiLM) | `compute_ccs(inject_film=True)` | `W_head · E[h(z_p) - h(z_ctrl)]` | **Primary metric**: total causal drug response (latent transition + drug FiLM modulation). |
+| **State-CCS** (Pure State Pushforward) | `compute_ccs(inject_film=False)` | `W_head · E[h(z_state) - h(z_ctrl)]` | Isolates pure differentiation/state shift, decoupled from chemical stress or off-target toxicity. |
+| **Linear Momentum** (Algorithm A, default) | `compute_momentum_score(style="linear")` | Factored path integral along `u_start` -> `u_end` | Quantifies average perturbation drive across discrete states (e.g. Rest $\to$ Stimulated). |
+| **Trajectory Momentum** (Algorithms C & D) | `compute_momentum_score(style="trajectory-waypoint")` | Factored integration along pseudotime waypoints | Captures state-dependent kinetics, transition stalls, and developmental branch shifts. |
+| **Trajectory Decomposition** | `compute_momentum_score(return_decomposition=True)` | Returns: Mean Drive (`gene`), TIV (`tiv`), LD (`ld`) | Detects **state-gated regulators** (perturbations whose causal effect is unlocked only at specific developmental stages). |
 
 ---
 
 ### 1. Empirical Latent State Displacement (ELSD)
-Computes empirical displacement vectors directly in unperturbed state space $u \in \mathcal{U}$:
+
+Computes the empirical displacement of perturbed cells relative to unperturbed control cells in latent state space:
+
+$$
+d_p(c) = \mathbb{E}_{i \in \text{Cells}(p, c)} [u_i] - \mathbb{E}_{j \in \text{Cells}(\text{ctrl}, c)} [u_j]
+$$
 
 ```python
 elsd_dict = pertvi.compute_elsd(
@@ -247,7 +252,26 @@ alignment_dict = pertvi.compute_pairwise_alignment(elsd_dict, metric="cosine")
 ---
 
 ### 2. Counterfactual Causal Scores (Coupled-CCS vs. State-CCS)
-Evaluates counterfactual potential outcomes by shifting the invariant control cell population along the estimated perturbation displacement: $u_{\text{cf}} = u_{\text{ctrl}} + d_p(c)$.
+
+Evaluates counterfactual potential outcomes by shifting the invariant control cell population along the estimated perturbation displacement:
+
+$$
+u_{\text{cf}} = u_{\text{ctrl}} + d_p(c)
+$$
+
+* **Coupled-CCS (`inject_film=True`)**:
+  Applies condition-specific FiLM modulators to capture total causal response (state transition + drug-specific transcriptional cascade):
+
+$$
+\Delta Y_p^{\text{Coupled}} = W_{\text{head}} \left( \mathbb{E} \left[ h\left((1 + \gamma_p) \odot u_{\text{cf}} + \beta_p\right) \right] - \mathbb{E} \left[ h(z_{\text{ctrl}}) \right] \right)
+$$
+
+* **State-CCS (`inject_film=False`)**:
+  Holds modulators fixed at control baseline to isolate pure state-transition effects decoupled from chemical stress or off-target toxicity:
+
+$$
+\Delta Y_p^{\text{State}} = W_{\text{head}} \left( \mathbb{E} \left[ h\left((1 + \gamma_{\text{ctrl}}) \odot u_{\text{cf}} + \beta_{\text{ctrl}}\right) \right] - \mathbb{E} \left[ h(z_{\text{ctrl}}) \right] \right)
+$$
 
 ```python
 # A. Gene-Level Coupled-CCS (Total Causal Response)
@@ -281,11 +305,18 @@ pathway_ccs = pertvi.compute_ccs(
 
 ### 3. Path-Integrated Perturbation Momentum
 
-Calculates the average causal drive exerted by a perturbation along an activation or differentiation path $\mathcal{P} = \{u_t\}_{t=1}^T$:
-$$M_p = \frac{1}{T} \sum_{t=1}^T \Big( \text{Decoder}(z_p(u_t)) - \text{Decoder}(z_{\text{ctrl}}(u_t)) \Big)$$
+Calculates the average causal drive exerted by a perturbation along an activation or differentiation path across $T$ discretized states:
 
-Because $W_{\text{head}}$ is linear, PertVI factors the trajectory integration directly into 128-dimensional hidden representation space:
-$$M_p \equiv W_{\text{head}} \left( \frac{1}{T} \sum_{t=1}^T [h(z_p(u_t)) - h(z_{\text{ctrl}}(u_t))] \right) = W_{\text{head}} \overline{\Delta h}_p$$
+$$
+M_p = \frac{1}{T} \sum_{t=1}^T \Big( \text{Decoder}(z_p(u_t)) - \text{Decoder}(z_{\text{ctrl}}(u_t)) \Big)
+$$
+
+Because the generative head $W_{\text{head}}$ is linear, PertVI factors the trajectory integration directly into 128-dimensional hidden representation space:
+
+$$
+M_p \equiv W_{\text{head}} \left( \frac{1}{T} \sum_{t=1}^T [h(z_p(u_t)) - h(z_{\text{ctrl}}(u_t))] \right) = W_{\text{head}} \overline{\Delta h}_p
+$$
+
 This hidden-space factorization achieves a **>900× speedup** and eliminates the need to materialize multi-gigabyte $(P \times T \times G)$ activation tensors.
 
 ```python
@@ -359,13 +390,16 @@ simulated_df = model.get_normalized_expression(
 ## 🔬 Deep Learning Reference & Hyperparameters
 
 ### Mathematical Objective Function
+
 PertVI optimizes a composite variational objective:
 
-$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{NB}} + \beta_{\text{cyc}}\text{KL}_{\text{cyc}} + \text{KL}_{\text{state}} + \text{KL}_{\text{ood}} + \text{KL}_{\ell} + \lambda_{\text{ood}} \mathcal{L}_{\text{ood\_L1}} + \lambda_{\text{cov}}^{\text{state}} \mathcal{L}_{\text{cov}}(q_m^{\text{st}}, q_m^{\text{cyc}}) + \lambda_{\text{cov}}^{\text{ood}} \mathcal{L}_{\text{cov}}^{\text{treated}}(q_m^{\text{ood}}, q_m^{\text{cyc}}) + \lambda_{\text{soft}} \| W_{\text{head}} \odot M_{\text{cyc}} \|_1$$
+$$
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{NB}} + \beta_{\text{cyc}}\text{KL}_{\text{cyc}} + \text{KL}_{\text{state}} + \text{KL}_{\text{ood}} + \text{KL}_{\ell} + \lambda_{\text{ood}} \mathcal{L}_{\text{ood}} + \lambda_{\text{cov}}^{\text{state}} \mathcal{L}_{\text{cov}}^{\text{state}} + \lambda_{\text{cov}}^{\text{ood}} \mathcal{L}_{\text{cov}}^{\text{ood}} + \lambda_{\text{soft}} \Vert W_{\text{head}} \odot M_{\text{cyc}} \Vert_1
+$$
 
 * **Deterministic Covariance Penalty on Posterior Means:** Covariance is evaluated strictly on centered encoder means $q_m$, eliminating stochastic sampling noise and stabilizing gradients.
-* **Floor-to-Max Annealing on OOD $L_1$:** Scheduled from $\lambda_{\text{floor}}=5.0$ to $\lambda_{\text{max}}=50.0$. Pins control cells to zero from the first epoch to prevent early manifold drift.
-* **Topological Cycle Relaxation ($\beta_{\text{cyc}}=0.5$):** Relaxes the standard Gaussian prior on $u_{\text{cycle}}$, allowing unconstrained continuous ring formation.
+* **Floor-to-Max Annealing on OOD $L_1$:** Scheduled from $\lambda = 5.0$ to $\lambda = 50.0$ (`floor_lambda_ood` to `max_lambda_ood`). Pins control cells to zero from the first epoch to prevent early manifold drift.
+* **Topological Cycle Relaxation ($\beta_{\text{cyc}}=0.5$):** Relaxes the standard Gaussian prior on `u_cycle`, allowing unconstrained continuous ring formation.
 
 ---
 
@@ -404,7 +438,7 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{NB}} + \beta_{\text{cyc}}\text
 | `ValueError: Column 'is_cycle_gene' not found in adata.var` | Cycle gene mask not set before model initialization. | Set `adata.var['is_cycle_gene'] = adata.var_names.isin(cycle_genes)` prior to calling `PertVI(adata)`. |
 | `ValueError: No control cells found matching control_group='NTC'` | Control string does not match `adata.obs[pert_key]`. | Verify `adata.obs[pert_key].unique()` and provide the exact matching string (e.g. `"Control"` or `"DMSO"`). |
 | `CUDA Out of Memory` during training | Batch size exceeds available GPU memory. | In `model.train()`, reduce `batch_size=128` or `batch_size=64`. |
-| `OOD Dimension Collapse` ($v_{\text{ood}}$ is all zero) | `is_treated` was left as `0.0` for all cells. | Ensure treated cells are explicitly marked `1.0` in `adata.obs['is_treated']`. |
+| `OOD Dimension Collapse` (`v_ood` is all zero) | `is_treated` was left as `0.0` for all cells. | Ensure treated cells are explicitly marked `1.0` in `adata.obs['is_treated']`. |
 | `Insufficient control cells (< 5)` | Condition has fewer than `min_cells` unperturbed cells. | Lower `min_cells=3` or pool replicate control wells across batches. |
 
 ---
@@ -412,4 +446,3 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{NB}} + \beta_{\text{cyc}}\text
 ## 📖 Citation
 
 TBD
-
