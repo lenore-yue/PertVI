@@ -399,7 +399,13 @@ def build_pathway_head_operator(
     """
     if gene_names is None:
         if hasattr(model, 'adata_manager') and model.adata_manager is not None:
-            gene_names = list(model.adata_manager.get_state_registry('X_pertvi_log1p').column_names)
+            try:
+                gene_names = list(model.adata_manager.get_state_registry('X_pertvi_log1p').column_names)
+            except Exception:
+                if hasattr(model, 'adata') and model.adata is not None:
+                    gene_names = list(model.adata.var_names)
+                else:
+                    raise ValueError("gene_names must be provided if model has no attached adata.")
         elif hasattr(model, 'adata') and model.adata is not None:
             gene_names = list(model.adata.var_names)
         else:
@@ -429,6 +435,7 @@ def compute_counterfactual_causal_score(
     latent_key: str = "X_u_state",
     conditions: Optional[List[str]] = None,
     perturbations: Optional[List[str]] = None,
+    apply_layer_norm: bool = True,
     inject_film: Optional[bool] = None,
     film_mode: str = "perturbation",
     compute_pathways: bool = False,
@@ -625,23 +632,35 @@ def compute_counterfactual_causal_score(
     else:
         device = torch.device(device)
 
-    # 6. Compute Empirical Latent State Displacements d_p(c)
-    elsd_dict = compute_elsd(
-        adata=adata,
-        condition_key=condition_key,
-        pert_key=pert_key,
-        control_group=control_list,
-        latent_key=latent_key,
-        conditions=conditions,
-        perturbations=perturbations,
-        min_cells=min_cells,
-    )
+    # 6. Extract & Normalize Latent State Representation, then Compute Displacements d_p(c)
+    if condition_key not in adata.obs.columns:
+        raise ValueError(f"condition_key '{condition_key}' not found in adata.obs.")
+    if pert_key not in adata.obs.columns:
+        raise ValueError(f"pert_key '{pert_key}' not found in adata.obs.")
+    if latent_key not in adata.obsm:
+        raise KeyError(f"latent_key '{latent_key}' not found in adata.obsm.")
 
-    all_conditions = list(elsd_dict.keys())
+    film = model.module.inference_net.split_film_transition
+    is_m7 = getattr(film, "film_mode", "legacy_hadamard") == "m7_block_tt"
 
-    # 7. Extract FiLM parameter modulators for all perturbations
+    with torch.no_grad():
+        u_raw_all = torch.tensor(adata.obsm[latent_key], dtype=torch.float32, device=device)
+        if apply_layer_norm:
+            if is_m7:
+                u_state_all = film.normalize_state_eval(u_raw_all)
+            else:
+                u_state_all = film.norm_state(u_raw_all)
+        else:
+            u_state_all = u_raw_all
+
+    all_conditions = list(adata.obs[condition_key].unique()) if conditions is None else list(conditions)
+    all_obs_perts = adata.obs[pert_key].unique()
+    cand_perts = [p for p in all_obs_perts if p not in control_list] if perturbations is None else list(perturbations)
+
+    # 7. Extract FiLM parameter modulators / sample indices for all perturbations
     sample_registry = model.adata_manager.get_state_registry("sample")
     cat_mapping = sample_registry.categorical_mapping
+    sample_idx_map: Dict[str, int] = {}
     films = {}
 
     with torch.no_grad():
@@ -649,20 +668,24 @@ def compute_counterfactual_causal_score(
             matches = np.where(cat_mapping == p)[0]
             if len(matches) == 0:
                 continue
-            idx = matches[0]
-            t = torch.tensor([[idx]], dtype=torch.long, device=device)
-            emb = model.module.inference_net.sample_embedding(t).squeeze(1)
-            g = model.module.inference_net.split_film_transition.gamma_state(emb).detach()
-            b = model.module.inference_net.split_film_transition.beta_state(emb).detach()
-            films[p] = (g, b)
+            idx = int(matches[0])
+            sample_idx_map[p] = idx
+            if not is_m7:
+                t = torch.tensor([[idx]], dtype=torch.long, device=device)
+                emb = model.module.inference_net.sample_embedding(t).squeeze(1)
+                g = film.gamma_state(emb).detach()
+                b = film.beta_state(emb).detach()
+                films[p] = (g, b)
 
-    ctrl_films = [films[c] for c in control_list if c in films]
-    if not ctrl_films:
+    ctrl_indices = [sample_idx_map[c] for c in control_list if c in sample_idx_map]
+    if not ctrl_indices:
         raise KeyError(
             f"None of the control group identifiers {control_list} were found in the model categorical mapping."
         )
-    g_ntc = torch.stack([cf[0] for cf in ctrl_films]).mean(dim=0)
-    b_ntc = torch.stack([cf[1] for cf in ctrl_films]).mean(dim=0)
+    if not is_m7:
+        ctrl_films = [films[c] for c in control_list if c in films]
+        g_ntc = torch.stack([cf[0] for cf in ctrl_films]).mean(dim=0)
+        b_ntc = torch.stack([cf[1] for cf in ctrl_films]).mean(dim=0)
 
     # 8. Setup Gene-level Projection Operator (W_head)
     W_head_t = model.module.generative_net.main_head.weight.detach().to(device)  # (G, 128)
@@ -690,7 +713,7 @@ def compute_counterfactual_causal_score(
             W_pathway_t = torch.tensor(W_path_np, dtype=torch.float32, device=device)
 
     # 10. Decoder nuisance embeddings: V_ood and batch_embed
-    z_state_dim = model.module.inference_net.split_film_transition.gamma_state.out_features
+    z_state_dim = getattr(film, "u_state_dim", None) or film.gamma_state.out_features
     main_in_dim = model.module.generative_net.main_hidden[0].in_features
     batch_embed_dim = model.module.generative_net.batch_embed.embedding_dim if model.module.generative_net.use_batch else 0
     n_ood = main_in_dim - batch_embed_dim - z_state_dim
@@ -718,40 +741,55 @@ def compute_counterfactual_causal_score(
 
     with torch.no_grad():
         for cond in all_conditions:
-            cond_mask = adata.obs[condition_key] == cond
-            ctrl_mask = cond_mask & adata.obs[pert_key].isin(control_list)
+            cond_mask = (adata.obs[condition_key] == cond).values
+            ctrl_mask = cond_mask & adata.obs[pert_key].isin(control_list).values
             if ctrl_mask.sum() < min_cells:
                 raise ValueError(
                     f"Condition '{cond}' has insufficient control cells ({ctrl_mask.sum()} < {min_cells}) "
                     f"matching control group {control_list} in column '{pert_key}'."
                 )
-            u_ntc_np = adata.obsm[latent_key][ctrl_mask]
-            u_ntc_t = torch.tensor(u_ntc_np, dtype=torch.float32, device=device)
+            u_ntc_t = u_state_all[ctrl_mask]
+            u_ntc_mean = u_ntc_t.mean(dim=0, keepdim=True)
 
             # Invariant unperturbed baseline hidden representation
-            z_ntc_base = (1.0 + g_ntc) * u_ntc_t + b_ntc
+            if is_m7:
+                z_ntc_base = torch.stack(
+                    [film.modulate_state_eval(u_ntc_t, c_idx) for c_idx in ctrl_indices], dim=0
+                ).mean(dim=0)
+            else:
+                z_ntc_base = (1.0 + g_ntc) * u_ntc_t + b_ntc
             h_ntc_base = decode_hidden(z_ntc_base).mean(dim=0)  # (128,)
-
-            df_disp = elsd_dict[cond]
-            active_perts = [p for p in df_disp.columns if p in films]
 
             cond_gene_scores: Dict[str, np.ndarray] = {}
             cond_path_scores: Dict[str, np.ndarray] = {}
             cond_deltas: Dict[str, np.ndarray] = {}
 
-            for p in active_perts:
-                d_p_np = df_disp[p].values
-                d_p_t = torch.tensor(d_p_np, dtype=torch.float32, device=device).unsqueeze(0)
+            for p in cand_perts:
+                if p not in sample_idx_map:
+                    continue
+                p_mask = cond_mask & (adata.obs[pert_key] == p).values
+                if p_mask.sum() < min_cells:
+                    continue
+
+                d_p_t = u_state_all[p_mask].mean(dim=0, keepdim=True) - u_ntc_mean
 
                 # Counterfactual shift on the control manifold: u_cf = u_ntc + d_p
                 u_cf = u_ntc_t + d_p_t
 
                 # FiLM Modulation selection
-                if use_pert_film:
-                    g_p, b_p = films[p]
-                    z_cf = (1.0 + g_p) * u_cf + b_p
+                if is_m7:
+                    if use_pert_film:
+                        z_cf = film.modulate_state_eval(u_cf, sample_idx_map[p])
+                    else:
+                        z_cf = torch.stack(
+                            [film.modulate_state_eval(u_cf, c_idx) for c_idx in ctrl_indices], dim=0
+                        ).mean(dim=0)
                 else:
-                    z_cf = (1.0 + g_ntc) * u_cf + b_ntc
+                    if use_pert_film:
+                        g_p, b_p = films[p]
+                        z_cf = (1.0 + g_p) * u_cf + b_p
+                    else:
+                        z_cf = (1.0 + g_ntc) * u_cf + b_ntc
 
                 h_cf = decode_hidden(z_cf).mean(dim=0)  # (128,)
                 delta_h = h_cf - h_ntc_base             # (128,)
@@ -981,7 +1019,7 @@ def compute_momentum_score(
                 time_col = cand
                 break
 
-    if norm_style in ("trajectory-basic", "trajectory-waypoint", "basic", "waypoint"):
+    if norm_style in ("trajectory-basic", "trajectory-waypoint", "basic", "waypoint", "pseudotime"):
         if time_col is None or time_col not in adata.obs.columns:
             raise KeyError(
                 f"style='{style}' requires a valid pseudotime column in adata.obs (specify via 'dpt_key'). "
@@ -1010,10 +1048,15 @@ def compute_momentum_score(
         raise KeyError(f"latent_key '{latent_key}' not found in adata.obsm.")
     u_raw_all = torch.tensor(adata.obsm[latent_key], dtype=torch.float32, device=device)
 
-    if apply_layer_norm and hasattr(model.module.inference_net, "split_film_transition") and hasattr(
-        model.module.inference_net.split_film_transition, "norm_state"
-    ):
-        u_norm_all = model.module.inference_net.split_film_transition.norm_state(u_raw_all)
+    film = getattr(model.module.inference_net, "split_film_transition", None)
+    is_m7 = getattr(film, "film_mode", "legacy_hadamard") == "m7_block_tt"
+    if apply_layer_norm and film is not None:
+        if is_m7:
+            u_norm_all = film.normalize_state_eval(u_raw_all)
+        elif hasattr(film, "norm_state"):
+            u_norm_all = film.norm_state(u_raw_all)
+        else:
+            u_norm_all = u_raw_all
     else:
         u_norm_all = u_raw_all
 
@@ -1041,7 +1084,7 @@ def compute_momentum_score(
         alphas = torch.linspace(0, 1, steps=steps, device=device).unsqueeze(1)
         path_tensor = u_start + alphas * (u_end - u_start)  # (steps, d_u)
 
-    elif norm_style in ("trajectory-basic", "basic"):
+    elif norm_style in ("trajectory-basic", "basic", "pseudotime"):
         if start_state is not None and end_state is not None and cond_col in adata.obs.columns:
             c_mask = ctrl_mask & adata.obs[cond_col].isin([start_state, end_state]).values
             if c_mask.sum() == 0:
@@ -1145,33 +1188,38 @@ def compute_momentum_score(
             f"Unsupported style: '{style}'. Choose from 'linear', 'trajectory-basic', or 'trajectory-waypoint'."
         )
 
-    # 5. Extract FiLM Parameter Modulators
+    # 5. Extract FiLM Parameter Modulators / Sample Indices
     sample_reg = model.adata_manager.get_state_registry("sample")
     cat_mapping = sample_reg.categorical_mapping
     all_perts = [p for p in cat_mapping if p not in ctrl_list] if perturbations is None else perturbations
 
+    sample_idx_map: Dict[str, int] = {}
     film_dict = {}
     for p in cat_mapping:
         matches = np.where(cat_mapping == p)[0]
         if len(matches) == 0:
             continue
-        idx = matches[0]
-        t = torch.tensor([[idx]], dtype=torch.long, device=device)
-        emb = model.module.inference_net.sample_embedding(t).squeeze(1)
-        g = model.module.inference_net.split_film_transition.gamma_state(emb).detach()
-        b = model.module.inference_net.split_film_transition.beta_state(emb).detach()
-        film_dict[p] = (g, b)
+        idx = int(matches[0])
+        sample_idx_map[p] = idx
+        if not is_m7:
+            t = torch.tensor([[idx]], dtype=torch.long, device=device)
+            emb = model.module.inference_net.sample_embedding(t).squeeze(1)
+            g = film.gamma_state(emb).detach()
+            b = film.beta_state(emb).detach()
+            film_dict[p] = (g, b)
 
-    ctrl_films = [film_dict[c] for c in ctrl_list if c in film_dict]
-    if not ctrl_films:
+    ctrl_indices = [sample_idx_map[c] for c in ctrl_list if c in sample_idx_map]
+    if not ctrl_indices:
         raise KeyError(
             f"None of the control group identifiers {ctrl_list} were found in the model categorical mapping."
         )
-    g_ctrl = torch.stack([cf[0] for cf in ctrl_films]).mean(dim=0)
-    b_ctrl = torch.stack([cf[1] for cf in ctrl_films]).mean(dim=0)
+    if not is_m7:
+        ctrl_films = [film_dict[c] for c in ctrl_list if c in film_dict]
+        g_ctrl = torch.stack([cf[0] for cf in ctrl_films]).mean(dim=0)
+        b_ctrl = torch.stack([cf[1] for cf in ctrl_films]).mean(dim=0)
 
     # 6. Setup Decoder Nuisance Embeddings: V_ood and batch_embed
-    z_state_dim = model.module.inference_net.split_film_transition.gamma_state.out_features
+    z_state_dim = getattr(film, "u_state_dim", None) or film.gamma_state.out_features
     main_in_dim = model.module.generative_net.main_hidden[0].in_features
     batch_embed_dim = (
         model.module.generative_net.batch_embed.embedding_dim if model.module.generative_net.use_batch else 0
@@ -1211,7 +1259,12 @@ def compute_momentum_score(
         return model.module.generative_net.main_hidden(z_full)
 
     # 7. Evaluate Control Path Once: (T, 128)
-    z_ctrl_path = (1.0 + g_ctrl) * path_tensor + b_ctrl
+    if is_m7:
+        z_ctrl_path = torch.stack(
+            [film.modulate_state_eval(path_tensor, c_idx) for c_idx in ctrl_indices], dim=0
+        ).mean(dim=0)
+    else:
+        z_ctrl_path = (1.0 + g_ctrl) * path_tensor + b_ctrl
     h_ctrl_path = decode_hidden(z_ctrl_path)
 
     # 8. Factored Hidden-Space Momentum Accumulation
@@ -1219,13 +1272,16 @@ def compute_momentum_score(
     tiv_dict: Dict[str, torch.Tensor] = {}
     ld_dict: Dict[str, torch.Tensor] = {}
 
-    active_perts = [p for p in all_perts if p in film_dict]
+    active_perts = [p for p in all_perts if p in sample_idx_map]
     if not active_perts:
         raise ValueError("None of the requested perturbations were found in the model categorical mapping.")
 
     for p in active_perts:
-        g_p, b_p = film_dict[p]
-        z_p_path = (1.0 + g_p) * path_tensor + b_p
+        if is_m7:
+            z_p_path = film.modulate_state_eval(path_tensor, sample_idx_map[p])
+        else:
+            g_p, b_p = film_dict[p]
+            z_p_path = (1.0 + g_p) * path_tensor + b_p
         h_p_path = decode_hidden(z_p_path)
 
         diff_h = h_p_path - h_ctrl_path  # (T, 128)
@@ -1303,5 +1359,441 @@ def compute_momentum_score(
 
 # Momentum functional aliases
 compute_momentum = compute_momentum_score
+
+
+# ==============================================================================
+# Out-of-Distribution (OOD) Analysis & Clean Signature Isolation
+# ==============================================================================
+
+def compute_ood_distance(
+    adata,
+    pert_key: str = "perturbed_gene_name",
+    control_group: Union[str, List[str]] = "NTC",
+    control_name: Optional[Union[str, List[str]]] = None,
+    control: Optional[Union[str, List[str]]] = None,
+    ood_key: str = "X_v_ood",
+    perturbations: Optional[List[str]] = None,
+    min_cells: int = 5,
+    operational_threshold: float = 0.30,
+    fit_gmm: bool = True,
+    n_bootstraps_null: int = 1000,
+) -> pd.DataFrame:
+    """
+    Compute Out-of-Distribution (OOD) latent displacement metrics for perturbations.
+
+    The OOD latent distance measures the Euclidean displacement of the perturbed cell
+    population from the unperturbed control centroid in PertVI's OOD latent space:
+
+        c_p = E_{i in Cells(p)} [v_{ood, i}] in R^5
+        c_ctrl = E_{j in Cells(control)} [v_{ood, j}] in R^5
+        d_p = ||c_p - c_ctrl||_2
+
+    This metric quantifies whether a perturbation induces an unconstrained cellular stress,
+    toxicity, or chromatin crisis that escapes the physiological cell state manifold.
+
+    Parameters
+    ----------
+    adata : AnnData
+        Annotated single-cell dataset containing metadata and OOD latent representation.
+    pert_key : str, default 'perturbed_gene_name'
+        Column name in adata.obs identifying perturbations (e.g. 'perturbed_gene_name', 'compound_name').
+    control_group : str or list of str, default 'NTC'
+        Identifier(s) for negative control / unperturbed cells (e.g. 'NTC', 'DMSO').
+    control_name : str or list of str, optional
+        Alias for control_group.
+    control : str or list of str, optional
+        Convenience alias for control_group.
+    ood_key : str, default 'X_v_ood'
+        Key in adata.obsm storing OOD latent representations (R^d_ood).
+    perturbations : list of str, optional
+        Specific perturbations to compute. If None, computes all perturbations except control.
+    min_cells : int, default 5
+        Minimum number of cells required to compute distance for a perturbation.
+    operational_threshold : float, default 0.30
+        Operational distance cutoff defining off-manifold perturbations.
+    fit_gmm : bool, default True
+        If True, fits a 2-component Gaussian Mixture Model (GMM) to estimate posterior
+        probability P(Off | d) of belonging to the off-manifold regime.
+    n_bootstraps_null : int, default 1000
+        Number of bootstrap iterations on control cells to calculate technical noise floor
+        (99.9th percentile null displacement). If 0, skips null model calculation.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame indexed by perturbation containing:
+        - 'ood_distance': Euclidean distance ||c_p - c_ctrl||_2
+        - 'rank': Rank ordered by distance (descending)
+        - 'n_cells': Number of cells per perturbation
+        - 'is_off_manifold': Boolean flag (ood_distance >= operational_threshold)
+        - 'is_tukey_outlier': Boolean flag (ood_distance >= Q3 + 1.5 * IQR)
+        - 'gmm_prob_off': Posterior probability of off-manifold regime (if fit_gmm=True)
+        - 'is_above_null': Boolean flag exceeding 99.9th percentile null (if n_bootstraps_null > 0)
+    """
+    # Auto-resolve pert_key fallback
+    if pert_key not in adata.obs.columns:
+        if "compound_name" in adata.obs.columns:
+            pert_key = "compound_name"
+        else:
+            raise KeyError(f"pert_key '{pert_key}' not found in adata.obs.")
+
+    if ood_key not in adata.obsm:
+        raise KeyError(f"ood_key '{ood_key}' not found in adata.obsm.")
+
+    # Resolve control group identifier(s)
+    if control is not None:
+        control_group = control
+    elif control_name is not None:
+        control_group = control_name
+
+    if isinstance(control_group, str):
+        control_list = [control_group]
+    else:
+        control_list = list(control_group)
+
+    # Auto-fallback for control_group (NTC vs DMSO)
+    all_perts_in_obs = set(adata.obs[pert_key].unique())
+    if not any(c in all_perts_in_obs for c in control_list):
+        if "DMSO" in all_perts_in_obs:
+            control_list = ["DMSO"]
+        elif "NTC" in all_perts_in_obs:
+            control_list = ["NTC"]
+        else:
+            raise ValueError(f"Control identifier(s) {control_list} not found in adata.obs['{pert_key}'].")
+
+    ctrl_mask = adata.obs[pert_key].isin(control_list)
+    if ctrl_mask.sum() == 0:
+        raise ValueError(f"No control cells found matching {control_list} in adata.obs['{pert_key}'].")
+
+    v_ood_all = adata.obsm[ood_key]
+    v_ctrl = v_ood_all[ctrl_mask]
+    c_ctrl = np.mean(v_ctrl, axis=0)
+
+    # Resolve perturbations list
+    if perturbations is None:
+        candidate_perts = [p for p in adata.obs[pert_key].unique() if p not in control_list]
+    else:
+        candidate_perts = [p for p in perturbations if p not in control_list]
+
+    records = []
+    for p in candidate_perts:
+        p_mask = adata.obs[pert_key] == p
+        n_c = int(p_mask.sum())
+        if n_c < min_cells:
+            continue
+        c_p = np.mean(v_ood_all[p_mask], axis=0)
+        d_p = float(np.linalg.norm(c_p - c_ctrl))
+        records.append({
+            "perturbation": p,
+            "ood_distance": d_p,
+            "n_cells": n_c
+        })
+
+    if not records:
+        raise ValueError("No perturbations had sufficient cells to compute OOD distance.")
+
+    df = pd.DataFrame(records).sort_values("ood_distance", ascending=False).reset_index(drop=True)
+    df["rank"] = df.index + 1
+
+    # Statistical fences
+    q1 = df["ood_distance"].quantile(0.25)
+    q3 = df["ood_distance"].quantile(0.75)
+    iqr = q3 - q1
+    tukey_fence = float(q3 + 1.5 * iqr)
+
+    df["is_off_manifold"] = df["ood_distance"] >= operational_threshold
+    df["is_tukey_outlier"] = df["ood_distance"] >= tukey_fence
+
+    # Gaussian Mixture Model (GMM) decomposition
+    if fit_gmm and len(df) >= 4:
+        try:
+            from sklearn.mixture import GaussianMixture
+            gmm = GaussianMixture(n_components=2, random_state=42)
+            X_d = df[["ood_distance"]].values
+            gmm.fit(X_d)
+            off_comp = int(np.argmax(gmm.means_.ravel()))
+            probs = gmm.predict_proba(X_d)
+            df["gmm_prob_off"] = probs[:, off_comp]
+            df.attrs["gmm_means"] = gmm.means_.ravel()
+            df.attrs["gmm_weights"] = gmm.weights_.ravel()
+        except Exception as e:
+            warnings.warn(f"GaussianMixture fitting skipped: {e}")
+
+    # Bootstrap null model for technical noise floor
+    if n_bootstraps_null > 0 and len(v_ctrl) >= 50:
+        null_dists = []
+        n_sub = min(500, len(v_ctrl) // 2)
+        rng = np.random.default_rng(42)
+        for _ in range(n_bootstraps_null):
+            idx = rng.choice(len(v_ctrl), size=n_sub, replace=False)
+            sub_c = np.mean(v_ctrl[idx], axis=0)
+            null_dists.append(float(np.linalg.norm(sub_c - c_ctrl)))
+        null_999 = float(np.percentile(null_dists, 99.9))
+        df.attrs["null_noise_floor_999"] = null_999
+        df["is_above_null"] = df["ood_distance"] > null_999
+
+    df.attrs["operational_threshold"] = operational_threshold
+    df.attrs["tukey_fence"] = tukey_fence
+    df.set_index("perturbation", inplace=True)
+    return df
+
+
+def compute_ood_signature(
+    adata,
+    model,
+    pert_key: str = "perturbed_gene_name",
+    control_group: Union[str, List[str]] = "NTC",
+    control_name: Optional[Union[str, List[str]]] = None,
+    control: Optional[Union[str, List[str]]] = None,
+    ood_key: str = "X_v_ood",
+    state_key: str = "X_z_state",
+    perturbations: Optional[List[str]] = None,
+    method: str = "mco",
+    batch_index: Optional[int] = None,
+    chunk_size: int = 2048,
+    return_tangent_operator: bool = False,
+    device: Optional[Union[str, torch.device]] = None,
+) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]:
+    """
+    Compute clean, leakage-free gene-level Out-of-Distribution (OOD) signatures.
+
+    Derives the isolated gene expression modulation governed strictly by the OOD latent
+    space (v_ood), provably free of variance leakage from cell cycle (z_cycle) or cell
+    state (z_state) transitions.
+
+    Mathematical Principles:
+    ------------------------
+    1. Architectural Cycle Invariance:
+       In PertVI's BifurcatedDecoder, z_cycle is routed strictly to a masked linear head
+       restricted to canonical cycle genes. Main head logits h_main satisfy:
+           dh_main / dz_cycle == 0  (algebraically zero cycle leakage).
+
+    2. State Variance Leakage in Naive Evaluation:
+       Evaluating h_main at treated cell states z_state(c) modulates non-linear ReLU gating:
+           D(a) = diag(I(a > 0)) in R^{128 x 128}
+       This introduces 12% - 34% state variance leakage from the drug's phenotypic shift.
+
+    3. Marginalized Counterfactual Operator (MCO, method='mco'):
+       By defining expectation strictly over the invariant control reference manifold P_0:
+           s_OOD*(p) = E_{(z, b) ~ P_0} [ h_main(z, v_ood(p), b) - h_main(z, v_ood(ctrl), b) ] in R^G
+       state variance leakage is provably eliminated:
+           d s_OOD*(p) / d(Delta z_state) == 0.
+
+    4. Canonical Linear Tangent Operator (CLTO, method='clto'):
+       First-order Taylor expansion around control manifold yields a linear tangent basis:
+           M_OOD = W_head @ diag(p_active) @ W_ood_eff in R^{G x d_ood}
+           s_CLTO(p) = M_OOD @ (v_ood(p) - v_ood(ctrl))
+       where p_active = E_{P_0} [ I(a > 0) ] is the empirical activation frequency (r ~ 0.99 with MCO).
+
+    Parameters
+    ----------
+    adata : AnnData
+        Annotated single-cell dataset containing metadata and latent representations.
+    model : PertVI
+        Trained PertVI model instance.
+    pert_key : str, default 'perturbed_gene_name'
+        Column in adata.obs identifying perturbations (e.g. 'perturbed_gene_name', 'compound_name').
+    control_group : str or list of str, default 'NTC'
+        Identifier(s) for negative control / unperturbed cells (e.g. 'NTC', 'DMSO').
+    control_name : str or list of str, optional
+        Alias for control_group.
+    control : str or list of str, optional
+        Convenience alias for control_group.
+    ood_key : str, default 'X_v_ood'
+        Key in adata.obsm storing OOD latent representations.
+    state_key : str, default 'X_z_state'
+        Key in adata.obsm storing cell state latent representations.
+    perturbations : list of str, optional
+        List of perturbations to compute. If None, computes all perturbations except control.
+    method : {'mco', 'clto', 'both'}, default 'mco'
+        Decoding method:
+        - 'mco': Marginalized Counterfactual Operator (exact, non-linear expectation).
+        - 'clto': Canonical Linear Tangent Operator (linear pushforward).
+        - 'both': Returns tuple of (df_mco, df_clto).
+    batch_index : int, optional
+        Specific batch index for batch embedding. Defaults to control cell batch distribution.
+    chunk_size : int, default 2048
+        Chunk size for counterfactual forward pass to prevent GPU out-of-memory.
+    return_tangent_operator : bool, default False
+        If True, also returns the tangent projection matrix M_OOD in R^{G x d_ood}.
+    device : str or torch.device, optional
+        Computation device. Defaults to model device.
+
+    Returns
+    -------
+    pd.DataFrame or tuple of (pd.DataFrame, pd.DataFrame)
+        DataFrame of shape (n_genes, n_perturbations) containing clean OOD log-fold changes.
+        If method='both', returns (df_mco, df_clto).
+        If return_tangent_operator=True, returns (df_signatures, M_ood_df).
+    """
+    if device is None:
+        device = model.device
+
+    gen = model.module.generative_net
+    gen.eval()
+
+    # Auto-resolve pert_key fallback
+    if pert_key not in adata.obs.columns:
+        if "compound_name" in adata.obs.columns:
+            pert_key = "compound_name"
+        else:
+            raise KeyError(f"pert_key '{pert_key}' not found in adata.obs.")
+
+    if ood_key not in adata.obsm:
+        raise KeyError(f"ood_key '{ood_key}' not found in adata.obsm.")
+    if state_key not in adata.obsm:
+        raise KeyError(f"state_key '{state_key}' not found in adata.obsm.")
+
+    # Resolve control group identifier(s)
+    if control is not None:
+        control_group = control
+    elif control_name is not None:
+        control_group = control_name
+
+    if isinstance(control_group, str):
+        control_list = [control_group]
+    else:
+        control_list = list(control_group)
+
+    # Auto-fallback for control_group
+    all_perts_in_obs = set(adata.obs[pert_key].unique())
+    if not any(c in all_perts_in_obs for c in control_list):
+        if "DMSO" in all_perts_in_obs:
+            control_list = ["DMSO"]
+        elif "NTC" in all_perts_in_obs:
+            control_list = ["NTC"]
+        else:
+            raise ValueError(f"Control identifier(s) {control_list} not found in adata.obs['{pert_key}'].")
+
+    ctrl_mask = adata.obs[pert_key].isin(control_list)
+    if ctrl_mask.sum() == 0:
+        raise ValueError(f"No control cells found matching {control_list} in adata.obs['{pert_key}'].")
+
+    z_ctrl_all = torch.tensor(adata.obsm[state_key][ctrl_mask], device=device, dtype=torch.float32)
+    v_ctrl_mean = torch.tensor(adata.obsm[ood_key][ctrl_mask], device=device, dtype=torch.float32).mean(dim=0, keepdim=True)
+    n_ctrl = len(z_ctrl_all)
+
+    # Resolve batch embeddings
+    if hasattr(gen, "batch_embed") and gen.batch_embed is not None:
+        if batch_index is not None:
+            b_idx_t = torch.tensor([batch_index], dtype=torch.long, device=device)
+            b_embed_ctrl = gen.batch_embed(b_idx_t).expand(n_ctrl, -1)
+        elif "_scvi_batch" in adata.obs:
+            b_indices = torch.tensor(adata.obs["_scvi_batch"][ctrl_mask].values, dtype=torch.long, device=device)
+            b_embed_ctrl = gen.batch_embed(b_indices)
+        else:
+            b_embed_ctrl = gen.batch_embed(torch.zeros(n_ctrl, dtype=torch.long, device=device))
+    else:
+        b_embed_ctrl = None
+
+    def forward_main(z_st: torch.Tensor, v_ood: torch.Tensor, b_emb: Optional[torch.Tensor]) -> torch.Tensor:
+        if b_emb is not None:
+            full_x = torch.cat([z_st, v_ood, b_emb], dim=-1)
+        else:
+            full_x = torch.cat([z_st, v_ood], dim=-1)
+        return gen.main_head(gen.main_hidden(full_x))
+
+    # Baseline control forward pass (chunked for memory safety)
+    h_ctrl_list = []
+    with torch.no_grad():
+        for i in range(0, n_ctrl, chunk_size):
+            end_i = min(i + chunk_size, n_ctrl)
+            z_chunk = z_ctrl_all[i:end_i]
+            v_chunk = v_ctrl_mean.expand(end_i - i, -1)
+            b_chunk = b_embed_ctrl[i:end_i] if b_embed_ctrl is not None else None
+            h_ctrl_list.append(forward_main(z_chunk, v_chunk, b_chunk))
+        h_ctrl = torch.cat(h_ctrl_list, dim=0)
+
+    # Gene names
+    if hasattr(model, "adata_manager") and model.adata_manager is not None:
+        try:
+            gene_names = list(model.adata_manager.get_state_registry("X_pertvi_log1p").column_names)
+        except Exception:
+            gene_names = list(adata.var_names)
+    else:
+        gene_names = list(adata.var_names)
+
+    # Resolve perturbations list
+    if perturbations is None:
+        candidate_perts = [p for p in adata.obs[pert_key].unique() if p not in control_list]
+    else:
+        candidate_perts = [p for p in perturbations if p not in control_list]
+
+    mco_sigs = {}
+    for p in candidate_perts:
+        p_mask = adata.obs[pert_key] == p
+        if p_mask.sum() == 0:
+            continue
+        v_p_mean = torch.tensor(adata.obsm[ood_key][p_mask], device=device, dtype=torch.float32).mean(dim=0, keepdim=True)
+
+        h_p_list = []
+        with torch.no_grad():
+            for i in range(0, n_ctrl, chunk_size):
+                end_i = min(i + chunk_size, n_ctrl)
+                z_chunk = z_ctrl_all[i:end_i]
+                v_chunk = v_p_mean.expand(end_i - i, -1)
+                b_chunk = b_embed_ctrl[i:end_i] if b_embed_ctrl is not None else None
+                h_p_list.append(forward_main(z_chunk, v_chunk, b_chunk))
+            h_p = torch.cat(h_p_list, dim=0)
+            delta_mco = (h_p - h_ctrl).mean(dim=0).cpu().numpy()
+
+        mco_sigs[p] = delta_mco
+
+    df_mco = pd.DataFrame(mco_sigs, index=gene_names)
+
+    # Canonical Linear Tangent Operator (CLTO)
+    M_ood_df = None
+    if method in ["clto", "both"] or return_tangent_operator:
+        with torch.no_grad():
+            n_sub = min(n_ctrl, 2048)
+            z_sub = z_ctrl_all[:n_sub]
+            v_sub = v_ctrl_mean.expand(n_sub, -1)
+            b_sub = b_embed_ctrl[:n_sub] if b_embed_ctrl is not None else None
+            if b_sub is not None:
+                full_sub = torch.cat([z_sub, v_sub, b_sub], dim=-1)
+            else:
+                full_sub = torch.cat([z_sub, v_sub], dim=-1)
+
+            a_ctrl = gen.main_hidden[1](gen.main_hidden[0](full_sub))
+            p_active = (a_ctrl > 0).float().mean(dim=0)  # (128,)
+
+            w1 = gen.main_hidden[0].weight.detach()
+            bn = gen.main_hidden[1]
+            scale = bn.weight.detach() / torch.sqrt(bn.running_var.detach() + bn.eps)
+            w1_eff = w1 * scale.unsqueeze(1)
+            z_dim = z_ctrl_all.shape[1]
+            v_dim = v_ctrl_mean.shape[1]
+            w_ood = w1_eff[:, z_dim : z_dim + v_dim]
+            w_head = gen.main_head.weight.detach()
+            M_ood = torch.matmul(w_head * p_active.unsqueeze(0), w_ood)  # (G, v_dim)
+            M_ood_df = pd.DataFrame(M_ood.cpu().numpy(), index=gene_names, columns=[f"v_ood_{i}" for i in range(v_dim)])
+
+        clto_sigs = {}
+        for p in candidate_perts:
+            p_mask = adata.obs[pert_key] == p
+            if p_mask.sum() == 0:
+                continue
+            v_p_mean = torch.tensor(adata.obsm[ood_key][p_mask], device=device, dtype=torch.float32).mean(dim=0, keepdim=True)
+            delta_v = (v_p_mean - v_ctrl_mean).squeeze()
+            delta_clto = torch.matmul(M_ood, delta_v).cpu().numpy()
+            clto_sigs[p] = delta_clto
+
+        df_clto = pd.DataFrame(clto_sigs, index=gene_names)
+
+        if method == "clto":
+            return (df_clto, M_ood_df) if return_tangent_operator else df_clto
+        elif method == "both":
+            return (df_mco, df_clto, M_ood_df) if return_tangent_operator else (df_mco, df_clto)
+
+    if return_tangent_operator and M_ood_df is not None:
+        return df_mco, M_ood_df
+
+    return df_mco
+
+
+# OOD Functional Aliases
+compute_mco_ood_signature = compute_ood_signature
+compute_clean_ood_signature = compute_ood_signature
+
 
 

@@ -14,9 +14,16 @@ from .downstream import (
     compute_causal_pushforward,
     compute_momentum_score,
     compute_momentum,
+    compute_ood_distance,
+    compute_ood_signature,
+    compute_mco_ood_signature,
+    compute_clean_ood_signature,
 )
 
+__version__ = "0.4.0"
+
 __all__ = [
+    "__version__",
     "PertVI",
     "downstream",
     "compute_elsd",
@@ -32,4 +39,8 @@ __all__ = [
     "compute_causal_pushforward",
     "compute_momentum_score",
     "compute_momentum",
+    "compute_ood_distance",
+    "compute_ood_signature",
+    "compute_mco_ood_signature",
+    "compute_clean_ood_signature",
 ]
