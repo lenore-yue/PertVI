@@ -265,6 +265,7 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             **datasplitter_kwargs,
         )
 
+        self.module.train()
         training_plan = PertVITrainingPlan(
             self.module,
             warmup_epochs=warmup_epochs,
@@ -296,7 +297,14 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
     @torch.inference_mode()
     def get_film_diagnostics(self) -> Dict[str, Union[np.ndarray, pd.DataFrame]]:
         """Extract learned FiLM SNR gates, effective modulators, and shrunk centroids."""
+        was_training = self.module.training
         self.module.eval()
+        try:
+            return self._get_film_diagnostics_impl()
+        finally:
+            self.module.train(was_training)
+
+    def _get_film_diagnostics_impl(self) -> Dict[str, Union[np.ndarray, pd.DataFrame]]:
         sample_names = np.asarray(
             self.adata_manager.get_state_registry("sample").categorical_mapping
         )
