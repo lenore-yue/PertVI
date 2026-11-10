@@ -12,6 +12,7 @@ from scvi.data.fields import LayerField, CategoricalObsField, NumericalJointObsF
 from scvi.train import TrainRunner, TrainingPlan
 from scvi.dataloaders import DataSplitter
 from ._module import PertVIModule
+from ._go_mask import build_go_cycle_and_quarantine_masks, GO_PATHWAY_NAMES
 
 _DEFAULT_CONTROL_TOKENS = {
     "ntc",
@@ -29,10 +30,10 @@ class PertVITrainingPlan(TrainingPlan):
     def __init__(
         self,
         module,
-        max_lambda_adv_state=100.0,  # Heavy penalty for State vs Cycle
-        max_lambda_adv_ood=5.0,      # Gentle penalty for OOD vs Cycle
-        max_lambda_ood=50.0,         # Max penalty for OOD leakage
-        floor_lambda_ood=5.0,        # Floor penalty to prevent garbage dump
+        max_lambda_adv_state=120.0,
+        max_lambda_adv_ood=120.0,
+        max_lambda_ood=100.0,
+        floor_lambda_ood=10.0,
         warmup_epochs=50,
         anneal_epochs=100,
         **kwargs,
@@ -46,7 +47,6 @@ class PertVITrainingPlan(TrainingPlan):
         self.anneal_epochs = anneal_epochs
 
     def _compute_standard_weight(self, max_weight):
-        """Standard annealing: 0.0 -> max_weight for covariance penalties."""
         epoch = self.current_epoch
         if epoch < self.warmup_epochs:
             return 0.0
@@ -57,33 +57,27 @@ class PertVITrainingPlan(TrainingPlan):
             return max_weight
 
     def _compute_floor_weight(self, floor_weight, max_weight):
-        """Floor annealing: floor_weight -> max_weight for the OOD L1 penalty."""
         epoch = self.current_epoch
         if epoch < self.warmup_epochs:
             return floor_weight
         elif epoch < self.warmup_epochs + self.anneal_epochs:
             progress = (epoch - self.warmup_epochs) / self.anneal_epochs
-            # Linearly interpolate between floor and max
             return floor_weight + (max_weight - floor_weight) * progress
         else:
             return max_weight
 
     def training_step(self, batch, batch_idx):
-        # Calculate dynamically scheduled weights
         current_lambda_adv_state = self._compute_standard_weight(self.max_lambda_adv_state)
         current_lambda_adv_ood = self._compute_standard_weight(self.max_lambda_adv_ood)
         current_lambda_ood = self._compute_floor_weight(self.floor_lambda_ood, self.max_lambda_ood)
 
-        # Inject weights directly into the module for the loss function
         self.module.current_lambda_adv_state = current_lambda_adv_state
         self.module.current_lambda_adv_ood = current_lambda_adv_ood
         self.module.current_lambda_ood = current_lambda_ood
 
-        # 3. Proceed with standard forward pass and loss calculation
         return super().training_step(batch, batch_idx)
 
     def on_train_epoch_end(self):
-        # Log the dynamic weights so we can track them in TensorBoard/W&B
         self.log("lambda_adv_state", self.module.current_lambda_adv_state, on_epoch=True, prog_bar=False)
         self.log("lambda_adv_ood", self.module.current_lambda_adv_ood, on_epoch=True, prog_bar=False)
         self.log("lambda_ood", self.module.current_lambda_ood, on_epoch=True, prog_bar=False)
@@ -92,6 +86,7 @@ class PertVITrainingPlan(TrainingPlan):
 
 class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
     _loading_legacy_ckpt: bool = False
+    _loading_v040_ckpt: bool = False
 
     def __init__(
         self,
@@ -101,29 +96,60 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         n_latent_ood: int = 10,
         cycle_gene_mask_key: str = "is_cycle_gene",
         control_groups: Optional[Union[str, List[str]]] = None,
+        cycle_encoder_mode: str = "go_pathway",
+        cycle_decoder_mode: Optional[str] = None,
+        two_tier_cycle_mask: bool = True,
+        split_ood_decoder: Optional[bool] = None,
+        direct_pathway_latent: bool = False,
         film_mode: str = "m7_block_tt",
+        cycle_norm_mode: Optional[str] = None,
+        cycle_prior_mode: Optional[str] = None,
+        deleak_radial_cycle: Optional[bool] = None,
+        selective_cycle_input: Optional[bool] = None,
+        ood_all_cells_hsic: Optional[bool] = None,
+        within_pert_hsic_weight: Optional[float] = None,
         lambda_film_gamma: float = 1.5,
         lambda_film_alpha: float = 1.0,
-        basal_gene_dropout_rate: Union[float, str] = 0.15,
-        ortho_mode: str = "linear_cov",
+        basal_gene_dropout_rate: Union[float, str] = "auto",
+        ood_sub_dropout_rate: Optional[float] = None,
+        ood_dropout_rate: Optional[float] = None,
+        ortho_mode: Optional[str] = None,
+        ood_anchor_mode: Optional[str] = None,
+        max_lambda_adv_state: Optional[float] = None,
+        max_lambda_adv_ood: Optional[float] = None,
+        lambda_soft: Optional[float] = None,
+        floor_lambda_ood: Optional[float] = None,
+        max_lambda_ood: Optional[float] = None,
+        lambda_drug_cycle_align: Optional[float] = None,
+        lambda_go_pathway: float = 5.0,
         **model_kwargs,
     ):
         super().__init__(adata)
 
         if getattr(self.__class__, "_loading_legacy_ckpt", False):
             film_mode = "legacy_hadamard"
+            cycle_encoder_mode = "standard"
+            cycle_decoder_mode = "linear"
+            split_ood_decoder = False
             basal_gene_dropout_rate = 0.0
+            ood_sub_dropout_rate = 0.0
+            ood_dropout_rate = 0.3
+            ortho_mode = "linear_cov"
+            ood_anchor_mode = "l1"
+            selective_cycle_input = False
             model_kwargs = dict(model_kwargs)
             model_kwargs.setdefault("max_col_norm", None)
+        elif getattr(self.__class__, "_loading_v040_ckpt", False):
+            cycle_encoder_mode = "standard"
+            cycle_decoder_mode = "linear"
+            split_ood_decoder = False
+            cycle_norm_mode = "matched_ln"
+            cycle_prior_mode = "standard_normal"
+            selective_cycle_input = False
 
-        # Extract the boolean mask from AnnData
         if cycle_gene_mask_key not in adata.var.columns:
             raise ValueError(f"Column '{cycle_gene_mask_key}' not found in adata.var.")
 
-        cycle_mask_array = adata.var[cycle_gene_mask_key].values.astype(bool)
-        cycle_gene_mask = torch.tensor(cycle_mask_array, dtype=torch.bool)
-
-        # Compute sample counts and auto-detect sample-level control categories
         cat_mapping = np.asarray(self.adata_manager.get_state_registry("sample").categorical_mapping)
         n_samples = len(cat_mapping)
 
@@ -154,6 +180,69 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         is_control_sample = torch.tensor(is_ctrl_np, dtype=torch.float32)
         n_obs_total = int(adata.n_obs)
 
+        # Build masks depending on cycle_encoder_mode
+        use_go_arch = (cycle_encoder_mode == "go_pathway") and (film_mode == "m7_block_tt")
+        if use_go_arch:
+            ctrl_cell_mask = is_ctrl_np[sample_codes] > 0.5
+            go_info = build_go_cycle_and_quarantine_masks(
+                adata,
+                cycle_gene_mask_key=cycle_gene_mask_key,
+                control_cell_mask=ctrl_cell_mask,
+            )
+            tirosh_mask = go_info["tirosh_mask"]
+            cycle_gene_mask = go_info["cycle_hard_mask"]
+            ood_quarantine_mask = go_info["ood_quarantine_mask"]
+            pathway_mask = go_info["pathway_mask"]
+            state_exclude_mask = tirosh_mask if bool(two_tier_cycle_mask) else cycle_gene_mask
+            self.go_pathway_names_ = list(go_info["pathway_names"])
+            self.go_gene_audit_df_ = go_info["gene_audit_df"]
+        else:
+            cycle_mask_array = adata.var[cycle_gene_mask_key].values.astype(bool)
+            cycle_gene_mask = torch.tensor(cycle_mask_array, dtype=torch.bool)
+            state_exclude_mask = cycle_gene_mask
+            ood_quarantine_mask = model_kwargs.pop("ood_quarantine_mask", cycle_gene_mask)
+            pathway_mask = model_kwargs.pop("pathway_mask", None)
+            self.go_pathway_names_ = list(GO_PATHWAY_NAMES) if pathway_mask is not None else []
+            self.go_gene_audit_df_ = None
+
+        # Resolve defaults based on whether v0.4.2 GO architecture is active
+        if cycle_decoder_mode is None:
+            cycle_decoder_mode = "go_cylindrical" if use_go_arch else "linear"
+        if split_ood_decoder is None:
+            split_ood_decoder = True if use_go_arch else False
+        if cycle_norm_mode is None:
+            cycle_norm_mode = "natural_identity" if use_go_arch else "matched_ln"
+        if cycle_prior_mode is None:
+            cycle_prior_mode = "anisotropic_normal" if use_go_arch else "standard_normal"
+        if deleak_radial_cycle is None:
+            deleak_radial_cycle = True if use_go_arch else False
+        if selective_cycle_input is None:
+            selective_cycle_input = True if use_go_arch else False
+        if ood_all_cells_hsic is None:
+            ood_all_cells_hsic = True if use_go_arch else False
+        if within_pert_hsic_weight is None:
+            within_pert_hsic_weight = 0.0
+        if ood_sub_dropout_rate is None:
+            ood_sub_dropout_rate = 0.05 if use_go_arch else 0.0
+        if ood_dropout_rate is None:
+            ood_dropout_rate = 0.0 if use_go_arch else 0.3
+        if ortho_mode is None:
+            ortho_mode = "snr_harmonic_hsic" if use_go_arch else "linear_cov"
+        if ood_anchor_mode is None:
+            ood_anchor_mode = "l2" if use_go_arch else "l1"
+        if max_lambda_adv_state is None:
+            max_lambda_adv_state = 120.0 if use_go_arch else 100.0
+        if max_lambda_adv_ood is None:
+            max_lambda_adv_ood = 120.0 if use_go_arch else 5.0
+        if lambda_soft is None:
+            lambda_soft = 150.0 if use_go_arch else 50.0
+        if floor_lambda_ood is None:
+            floor_lambda_ood = 10.0 if use_go_arch else 5.0
+        if max_lambda_ood is None:
+            max_lambda_ood = 100.0 if use_go_arch else 50.0
+        if lambda_drug_cycle_align is None:
+            lambda_drug_cycle_align = 25.0 if use_go_arch else 0.0
+
         self.module = PertVIModule(
             n_input=self.summary_stats.n_vars,
             n_batch=self.summary_stats.n_batch,
@@ -162,17 +251,42 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             n_latent_state=n_latent_state,
             n_latent_ood=n_latent_ood,
             cycle_gene_mask=cycle_gene_mask,
+            state_exclude_mask=state_exclude_mask,
+            ood_quarantine_mask=ood_quarantine_mask,
+            pathway_mask=pathway_mask,
+            cycle_encoder_mode=cycle_encoder_mode,
+            cycle_decoder_mode=cycle_decoder_mode,
+            split_ood_decoder=split_ood_decoder,
+            direct_pathway_latent=direct_pathway_latent,
             n_obs_total=n_obs_total,
             sample_counts=sample_counts,
             is_control_sample=is_control_sample,
             film_mode=film_mode,
+            cycle_norm_mode=cycle_norm_mode,
+            cycle_prior_mode=cycle_prior_mode,
+            deleak_radial_cycle=deleak_radial_cycle,
+            selective_cycle_input=selective_cycle_input,
+            ood_all_cells_hsic=ood_all_cells_hsic,
+            within_pert_hsic_weight=within_pert_hsic_weight,
             lambda_film_gamma=lambda_film_gamma,
             lambda_film_alpha=lambda_film_alpha,
             basal_gene_dropout_rate=basal_gene_dropout_rate,
+            ood_sub_dropout_rate=ood_sub_dropout_rate,
+            ood_dropout_rate=ood_dropout_rate,
             ortho_mode=ortho_mode,
+            ood_anchor_mode=ood_anchor_mode,
+            max_lambda_adv_state=max_lambda_adv_state,
+            max_lambda_adv_ood=max_lambda_adv_ood,
+            lambda_soft=lambda_soft,
+            floor_lambda_ood=floor_lambda_ood,
+            max_lambda_ood=max_lambda_ood,
+            lambda_drug_cycle_align=lambda_drug_cycle_align,
+            lambda_go_pathway=lambda_go_pathway if use_go_arch else 0.0,
             **model_kwargs,
         )
-        self._model_summary_string = "Disentangled Multi-resolution Variational Inference for Perturbation Analysis."
+        self._model_summary_string = (
+            "Disentangled Multi-resolution Variational Inference with GO Pathway-Masked Cell-Cycle Encoder (v0.4.2)."
+        )
         self.init_params_ = self._get_init_params(locals())
 
     @classmethod
@@ -187,12 +301,16 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
     ):
         pt_path = os.path.join(dir_path, f"{prefix or ''}model.pt")
         is_legacy = False
+        is_v040 = False
         if os.path.exists(pt_path):
             ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
             sd = ckpt.get("model_state_dict", {})
             if "inference_net.split_film_transition.gamma_state.bias" in sd:
                 is_legacy = True
+            elif "inference_net.encoder_cycle.pathway_linear.weight" not in sd:
+                is_v040 = True
         cls._loading_legacy_ckpt = is_legacy
+        cls._loading_v040_ckpt = is_v040
         try:
             return super().load(
                 dir_path,
@@ -204,6 +322,7 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             )
         finally:
             cls._loading_legacy_ckpt = False
+            cls._loading_v040_ckpt = False
 
     @classmethod
     def setup_anndata(
@@ -217,7 +336,6 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
     ):
         setup_method_args = cls._get_setup_method_args(**locals())
 
-        # PHASE 2 FIX: Removed the S_score and G2M_score dependencies
         anndata_fields = [
             LayerField("X", layer, is_count_data=True),
             CategoricalObsField("batch", batch_key),
@@ -233,10 +351,10 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         max_epochs=400,
         warmup_epochs=50,
         anneal_epochs=100,
-        max_lambda_adv_state=100.0,
-        max_lambda_adv_ood=5.0,
-        max_lambda_ood=50.0,
-        floor_lambda_ood=5.0,
+        max_lambda_adv_state=None,
+        max_lambda_adv_ood=None,
+        max_lambda_ood=None,
+        floor_lambda_ood=None,
         train_size=0.8,
         validation_size=None,
         batch_size=256,
@@ -248,10 +366,17 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         datasplitter_kwargs=None,
         **trainer_kwargs,
     ):
-        import torch
-
         plan_kwargs = plan_kwargs or {}
         datasplitter_kwargs = datasplitter_kwargs or {}
+
+        if max_lambda_adv_state is None:
+            max_lambda_adv_state = self.module.max_lambda_adv_state
+        if max_lambda_adv_ood is None:
+            max_lambda_adv_ood = self.module.max_lambda_adv_ood
+        if max_lambda_ood is None:
+            max_lambda_ood = self.module.max_lambda_ood
+        if floor_lambda_ood is None:
+            floor_lambda_ood = self.module.floor_lambda_ood
 
         if accelerator == "auto":
             accelerator = "gpu" if (use_gpu and torch.cuda.is_available()) else "cpu"
@@ -419,36 +544,58 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         batch_size=None,
     ):
         self._check_if_trained(warn=False)
-        adata = self._validate_anndata(adata)
-        scdl = self._make_data_loader(
-            adata=adata, indices=indices, batch_size=batch_size
-        )
+        was_training = self.module.training
+        self.module.eval()
+        try:
+            adata = self._validate_anndata(adata)
+            scdl = self._make_data_loader(
+                adata=adata, indices=indices, batch_size=batch_size
+            )
 
-        # Added z_cycle and z_state extractors
-        latent_spaces = {
-            "u_cycle": [], "u_state": [], "v_ood": [],
-            "z_cycle": [], "z_state": [],
-            "z_shift": [], "z_base": [], "z_final": [],
-        }
+            latent_spaces = {
+                "u_cycle": [],
+                "u_state": [],
+                "v_ood": [],
+                "u_cycle_src": [],
+                "u_state_src": [],
+                "z_cycle": [],
+                "z_state": [],
+                "z_shift": [],
+                "z_base": [],
+                "z_final": [],
+            }
+            opt_keys = ("u_cycle_go", "z_cycle_go", "u_cycle_go_enc", "emp_go_scores")
+            opt_buffers = {k: [] for k in opt_keys}
 
-        for tensors in scdl:
-            inference_inputs = self.module._get_inference_input(tensors)
-            outputs = self.module.inference(**inference_inputs)
+            for tensors in scdl:
+                inference_inputs = self.module._get_inference_input(tensors)
+                outputs = self.module.inference(**inference_inputs)
 
-            latent_spaces["u_cycle"].append(outputs["q_m_cycle"].cpu().numpy())
-            latent_spaces["u_state"].append(outputs["q_m_state"].cpu().numpy())
-            latent_spaces["v_ood"].append(outputs["q_m_ood"].cpu().numpy())
+                latent_spaces["u_cycle"].append(outputs["q_m_cycle"].cpu().numpy())
+                latent_spaces["u_state"].append(outputs["q_m_state"].cpu().numpy())
+                latent_spaces["v_ood"].append(outputs["q_m_ood"].cpu().numpy())
+                latent_spaces["u_cycle_src"].append(outputs["u_cycle_src"].cpu().numpy())
+                latent_spaces["u_state_src"].append(outputs["u_state_src"].cpu().numpy())
 
-            latent_spaces["z_cycle"].append(outputs["z_cycle"].cpu().numpy())
-            latent_spaces["z_state"].append(outputs["z_state"].cpu().numpy())
-            latent_spaces["z_shift"].append(outputs["z_shift"].cpu().numpy())
-            latent_spaces["z_base"].append(outputs["z_base"].cpu().numpy())
-            latent_spaces["z_final"].append(outputs["z_final"].cpu().numpy())
+                latent_spaces["z_cycle"].append(outputs["z_cycle"].cpu().numpy())
+                latent_spaces["z_state"].append(outputs["z_state"].cpu().numpy())
+                latent_spaces["z_shift"].append(outputs["z_shift"].cpu().numpy())
+                latent_spaces["z_base"].append(outputs["z_base"].cpu().numpy())
+                latent_spaces["z_final"].append(outputs["z_final"].cpu().numpy())
 
-        for key in latent_spaces.keys():
-            latent_spaces[key] = np.concatenate(latent_spaces[key], axis=0)
+                for k in opt_keys:
+                    if k in outputs and outputs[k] is not None:
+                        opt_buffers[k].append(outputs[k].cpu().numpy())
 
-        return latent_spaces
+            for key in latent_spaces.keys():
+                latent_spaces[key] = np.concatenate(latent_spaces[key], axis=0)
+            for k in opt_keys:
+                if len(opt_buffers[k]) > 0:
+                    latent_spaces[k] = np.concatenate(opt_buffers[k], axis=0)
+
+            return latent_spaces
+        finally:
+            self.module.train(was_training)
 
     @torch.inference_mode()
     def get_normalized_expression(
@@ -460,51 +607,46 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         target_sum=10000,
         batch_size=128,
     ):
-        """
-        Generates denoised / counterfactual expression.
-        Use transform_batch to harmonize technical noise.
-        Use transform_sample to generate counterfactual drug responses.
-        """
         self._check_if_trained(warn=False)
-        adata = self._validate_anndata(adata)
-        scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+        was_training = self.module.training
+        self.module.eval()
+        try:
+            adata = self._validate_anndata(adata)
+            scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
 
-        # Batch Registry Lookup
-        target_batch_idx = None
-        if transform_batch is not None:
-            batch_mapping = self.adata_manager.get_state_registry("batch").categorical_mapping
-            if transform_batch not in batch_mapping:
-                raise ValueError(f"Batch '{transform_batch}' not found.")
-            target_batch_idx = np.where(batch_mapping == transform_batch)[0][0]
+            target_batch_idx = None
+            if transform_batch is not None:
+                batch_mapping = self.adata_manager.get_state_registry("batch").categorical_mapping
+                if transform_batch not in batch_mapping:
+                    raise ValueError(f"Batch '{transform_batch}' not found.")
+                target_batch_idx = np.where(batch_mapping == transform_batch)[0][0]
 
-        # Sample (Perturbation) Registry Lookup
-        target_sample_idx = None
-        if transform_sample is not None:
-            sample_mapping = self.adata_manager.get_state_registry("sample").categorical_mapping
-            if transform_sample not in sample_mapping:
-                raise ValueError(f"Sample '{transform_sample}' not found.")
-            target_sample_idx = np.where(sample_mapping == transform_sample)[0][0]
+            target_sample_idx = None
+            if transform_sample is not None:
+                sample_mapping = self.adata_manager.get_state_registry("sample").categorical_mapping
+                if transform_sample not in sample_mapping:
+                    raise ValueError(f"Sample '{transform_sample}' not found.")
+                target_sample_idx = np.where(sample_mapping == transform_sample)[0][0]
 
-        exprs = []
-        for tensors in scdl:
-            # Overwrite batch tensor for denoising
-            if target_batch_idx is not None:
-                tensors[scvi.REGISTRY_KEYS.BATCH_KEY] = torch.full_like(
-                    tensors[scvi.REGISTRY_KEYS.BATCH_KEY], target_batch_idx
-                )
+            exprs = []
+            for tensors in scdl:
+                if target_batch_idx is not None:
+                    tensors[scvi.REGISTRY_KEYS.BATCH_KEY] = torch.full_like(
+                        tensors[scvi.REGISTRY_KEYS.BATCH_KEY], target_batch_idx
+                    )
+                if target_sample_idx is not None:
+                    tensors["sample"] = torch.full_like(
+                        tensors["sample"], target_sample_idx
+                    )
 
-            # Overwrite sample tensor for counterfactual generation
-            if target_sample_idx is not None:
-                tensors["sample"] = torch.full_like(
-                    tensors["sample"], target_sample_idx
-                )
+                inference_inputs = self.module._get_inference_input(tensors)
+                inference_outputs = self.module.inference(**inference_inputs)
+                generative_inputs = self.module._get_generative_input(tensors, inference_outputs)
+                generative_outputs = self.module.generative(**generative_inputs)
 
-            inference_inputs = self.module._get_inference_input(tensors)
-            inference_outputs = self.module.inference(**inference_inputs)
-            generative_inputs = self.module._get_generative_input(tensors, inference_outputs)
-            generative_outputs = self.module.generative(**generative_inputs)
+                exprs.append(generative_outputs["px_scale"].cpu().numpy() * target_sum)
 
-            exprs.append(generative_outputs["px_scale"].cpu().numpy() * target_sum)
-
-        exprs_array = np.concatenate(exprs, axis=0)
-        return pd.DataFrame(exprs_array, index=adata.obs_names, columns=adata.var_names)
+            exprs_array = np.concatenate(exprs, axis=0)
+            return pd.DataFrame(exprs_array, index=adata.obs_names, columns=adata.var_names)
+        finally:
+            self.module.train(was_training)

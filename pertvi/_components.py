@@ -1,3 +1,4 @@
+import math
 from typing import Optional, Tuple, Union
 
 import numpy as np
@@ -25,16 +26,182 @@ class MaxColNorm(nn.Module):
 
 
 # ==========================================
-# FiLM transition block (v0.4.0 M7-InvDrop + legacy Hadamard)
+# Cylindrical-Harmonic Feature Expansion (v0.4.2)
+# ==========================================
+def expand_cylindrical_harmonics(
+    z_cycle: torch.Tensor,
+    harmonic_2theta_scale: float = 0.25,
+    z2_scale: float = 0.05,
+) -> torch.Tensor:
+    """Expands a 3D phase-loop coordinate z_cycle = (z_0, z_1, z_2) into a 6D cylindrical-harmonic basis:
+       phi_cyl(z) = [z_0, z_1, z2_scale * z_2, r_12 - 1.0, s_2 * r_12 * cos(2*theta), s_2 * r_12 * sin(2*theta)].
+    If z_cycle has dimension != 3 (e.g., 6D direct pathway mode), returns z_cycle directly.
+    """
+    if z_cycle.shape[-1] != 3:
+        return z_cycle
+    r_z = torch.sqrt(z_cycle[:, 0:1].pow(2) + z_cycle[:, 1:2].pow(2) + 1e-6)
+    c1 = z_cycle[:, 0:1] / r_z
+    s1 = z_cycle[:, 1:2] / r_z
+    c2 = float(harmonic_2theta_scale) * r_z * (c1.pow(2) - s1.pow(2))
+    s2 = float(harmonic_2theta_scale) * r_z * (2.0 * s1 * c1)
+    return torch.cat(
+        [
+            z_cycle[:, 0:2],
+            float(z2_scale) * z_cycle[:, 2:3],
+            r_z - 1.0,
+            c2,
+            s2,
+        ],
+        dim=-1,
+    )
+
+
+# ==========================================
+# GO Pathway-Masked Cell-Cycle Encoder (v0.4.2)
+# ==========================================
+class PathwayCycleEncoder(nn.Module):
+    """GO/Reactome Pathway-Masked Cell-Cycle Encoder (v0.4.2).
+
+    Architecture:
+      1. Hard-masks the input weight matrix W_in in R^{(K * H_p) x G} by the binary pathway
+         membership matrix M_path in {0, 1}^{K x G} (scaled by sqrt(G_cyc / |P_k|) per pathway),
+         so sub-block k exclusively reads genes belonging to GO cell-cycle module P_k.
+      2. Extracts K=6 explicit basal GO pathway activations u_cycle_go_enc in R^{N x K}.
+      3. In ``hierarchical_3d`` mode (default, n_output=3), projects the concatenated K*H_p
+         pathway representations onto the 3D unforced hysteresis-loop posterior
+         (q_m_cycle, q_v_cycle, u_cycle) in R^3 (capturing 97.59% of 6-module variance while
+         filtering out the 2.41% collinear noise subspace).
+      4. In ``direct_6d`` mode (n_output=K), maps each pathway sub-block k directly to its own
+         latent coordinate (q_m_cycle[:, k], q_v_cycle[:, k]) in R^K.
+    """
+
+    def __init__(
+        self,
+        n_input: int,
+        pathway_mask: torch.Tensor,
+        n_output: int = 3,
+        n_hidden_per_pathway: int = 16,
+        n_hidden: int = 128,
+        dropout_rate: float = 0.0,
+        direct_pathway_latent: bool = False,
+        var_eps: float = 1e-4,
+    ):
+        super().__init__()
+        M_path = torch.as_tensor(pathway_mask, dtype=torch.float32)
+        if M_path.ndim != 2 or M_path.shape[1] != n_input:
+            raise ValueError(
+                f"pathway_mask must have shape (K, {n_input}), got {tuple(M_path.shape)}."
+            )
+        self.n_input = int(n_input)
+        self.n_pathways = int(M_path.shape[0])
+        self.n_output = int(n_output)
+        self.n_hidden_per_pathway = int(n_hidden_per_pathway)
+        self.n_hidden = int(n_hidden)
+        self.direct_pathway_latent = bool(direct_pathway_latent) and (self.n_output == self.n_pathways)
+        self.var_eps = float(var_eps)
+
+        # Normalize per-pathway input mask by sqrt(G_cyc / |P_k|) so smaller GO modules have balanced gradient norm
+        cyc_union = (M_path.sum(dim=0) > 0).float()
+        g_cyc_total = cyc_union.sum().clamp(min=1.0)
+        p_counts = M_path.sum(dim=1, keepdim=True).clamp(min=1.0)
+        scaled_M_path = M_path * torch.sqrt(g_cyc_total / p_counts)
+
+        # Expand (K, G) -> (K * H_p, G)
+        expanded_mask = scaled_M_path.repeat_interleave(self.n_hidden_per_pathway, dim=0)
+        self.register_buffer("pathway_mask", M_path)
+        self.register_buffer("expanded_input_mask", expanded_mask)
+
+        total_path_hid = self.n_pathways * self.n_hidden_per_pathway
+        self.pathway_linear = nn.Linear(self.n_input, total_path_hid, bias=False)
+        with torch.no_grad():
+            self.pathway_linear.weight.mul_(expanded_mask > 0)
+
+        self.pathway_norm = nn.LayerNorm(self.n_hidden_per_pathway, elementwise_affine=False)
+        self.pathway_act = nn.GELU()
+        self.pathway_dropout = nn.Dropout(float(dropout_rate)) if float(dropout_rate) > 0.0 else nn.Identity()
+
+        # Explicit per-pathway scalar readout: (N, K, H_p) -> (N, K)
+        self.pathway_score_weight = nn.Parameter(
+            torch.randn(self.n_pathways, self.n_hidden_per_pathway) / math.sqrt(self.n_hidden_per_pathway)
+        )
+        self.pathway_score_bias = nn.Parameter(torch.zeros(self.n_pathways))
+
+        if self.direct_pathway_latent:
+            self.direct_mean_weight = nn.Parameter(
+                torch.randn(self.n_pathways, self.n_hidden_per_pathway) / math.sqrt(self.n_hidden_per_pathway)
+            )
+            self.direct_mean_bias = nn.Parameter(torch.zeros(self.n_pathways))
+            self.direct_var_weight = nn.Parameter(
+                torch.zeros(self.n_pathways, self.n_hidden_per_pathway)
+            )
+            self.direct_var_bias = nn.Parameter(torch.full((self.n_pathways,), -2.0))
+        else:
+            self.loop_fc = nn.Sequential(
+                nn.Linear(total_path_hid, self.n_hidden),
+                nn.BatchNorm1d(self.n_hidden),
+                nn.ReLU(),
+                self.pathway_dropout,
+            )
+            self.mean_encoder = nn.Linear(self.n_hidden, self.n_output)
+            self.var_encoder = nn.Linear(self.n_hidden, self.n_output)
+            nn.init.constant_(self.var_encoder.bias, -2.0)
+
+        self.last_u_cycle_go_enc: Optional[torch.Tensor] = None
+
+    def compute_empirical_go_scores(self, x_cycle: torch.Tensor) -> torch.Tensor:
+        """Computes the centered empirical GO module averages directly from x_cycle: (N, K)."""
+        M = self.pathway_mask.to(device=x_cycle.device, dtype=x_cycle.dtype)
+        denom = M.sum(dim=1, keepdim=True).clamp(min=1.0).t()  # (1, K)
+        raw_scores = torch.matmul(x_cycle, M.t()) / denom  # (N, K)
+        return raw_scores - raw_scores.mean(dim=0, keepdim=True)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_go_scores: bool = False,
+    ):
+        mask_exp = self.expanded_input_mask.to(device=x.device, dtype=x.dtype)
+        masked_w = self.pathway_linear.weight * mask_exp
+        h_flat = F.linear(x, masked_w, self.pathway_linear.bias)
+        h_path = h_flat.view(x.shape[0], self.n_pathways, self.n_hidden_per_pathway)
+        h_path = self.pathway_dropout(self.pathway_act(self.pathway_norm(h_path)))
+
+        u_cycle_go_enc = (h_path * self.pathway_score_weight.unsqueeze(0)).sum(dim=-1) + self.pathway_score_bias.unsqueeze(0)
+        self.last_u_cycle_go_enc = u_cycle_go_enc
+
+        if self.direct_pathway_latent:
+            q_m = (h_path * self.direct_mean_weight.unsqueeze(0)).sum(dim=-1) + self.direct_mean_bias.unsqueeze(0)
+            lv = (h_path * self.direct_var_weight.unsqueeze(0)).sum(dim=-1) + self.direct_var_bias.unsqueeze(0)
+            q_v = torch.exp(torch.clamp(lv, min=-8.0, max=3.0)) + self.var_eps
+        else:
+            h_loop = self.loop_fc(h_path.reshape(x.shape[0], -1))
+            q_m = self.mean_encoder(h_loop)
+            lv = self.var_encoder(h_loop)
+            q_v = torch.exp(torch.clamp(lv, min=-8.0, max=3.0)) + self.var_eps
+
+        if self.training:
+            latent = q_m + torch.sqrt(q_v) * torch.randn_like(q_m)
+        else:
+            latent = q_m
+
+        if return_go_scores:
+            return q_m, q_v, latent, u_cycle_go_enc
+        return q_m, q_v, latent
+
+
+# ==========================================
+# FiLM transition block (v0.4.2 Natural-Identity + v0.4.1 RMSNorm + v0.4.0 MatchedLN + legacy Hadamard)
 # ==========================================
 class SplitNaturalShiftFiLM(nn.Module):
     """Disentangled state and cell-cycle FiLM transition module.
 
     Supports:
-    - ``film_mode="m7_block_tt"`` (default in v0.4.0): Stoch-SNR Block-TT WP-FiLM with
-      variance-matched bias-free LayerNorm (``MatchedLN``), sample-level control identity
-      clamping, count-weighted EMA sufficient statistics, Pre-LN Hill-2 KL-SNR gates,
-      and exact Schur-product functional L2 prior over pooled + control reference covariance.
+    - ``film_mode="m7_block_tt"`` (default): Stoch-SNR Block-TT WP-FiLM with:
+      - ``cycle_norm_mode="natural_identity"`` (v0.4.2 GO-pathway default): preserves natural
+        radial amplitude and origin-anchored quiescence (u_cycle / R_star) with planar
+        origin-centered cycle FiLM and per-perturbation radial de-leaking.
+      - ``cycle_norm_mode="rms_norm"`` (v0.4.1 J2): variance-matched bias-free RMSNorm on u_cycle.
+      - ``cycle_norm_mode="matched_ln"`` (v0.4.0 M7): variance-matched bias-free LayerNorm.
     - ``film_mode="legacy_hadamard"``: backward-compatible v0.3.0 diagonal affine FiLM.
     """
 
@@ -45,6 +212,14 @@ class SplitNaturalShiftFiLM(nn.Module):
         drug_embed_dim: int = 16,
         n_samples: int = 1,
         film_mode: str = "m7_block_tt",
+        transition_mode: Optional[str] = None,
+        cycle_norm_mode: str = "matched_ln",
+        r_star_cycle: float = 1.0,
+        deleak_radial_cycle: bool = False,
+        lambda_gamma_state: float = 1.5,
+        lambda_alpha_state: float = 1.0,
+        lambda_gamma_cycle: Optional[float] = None,
+        lambda_alpha_cycle: Optional[float] = None,
         rank_gamma: int = 16,
         tau_snr: float = 1.5,
         m0_shrink: float = 10.0,
@@ -56,42 +231,59 @@ class SplitNaturalShiftFiLM(nn.Module):
         is_control_sample: Optional[torch.Tensor] = None,
     ):
         super().__init__()
+        if transition_mode is not None:
+            film_mode = transition_mode
         if film_mode not in ("m7_block_tt", "legacy_hadamard"):
             raise ValueError(
                 f"Unsupported film_mode='{film_mode}'. Choose 'm7_block_tt' or 'legacy_hadamard'."
+            )
+        if cycle_norm_mode not in ("natural_identity", "rms_norm", "matched_ln"):
+            raise ValueError(
+                f"Unsupported cycle_norm_mode='{cycle_norm_mode}'. "
+                "Choose 'natural_identity', 'rms_norm', or 'matched_ln'."
             )
 
         self.u_cycle_dim = int(u_cycle_dim)
         self.u_state_dim = int(u_state_dim)
         self.drug_embed_dim = int(drug_embed_dim)
         self.film_mode = film_mode
+        self.transition_mode = film_mode
+        self.cycle_norm_mode = cycle_norm_mode
+        self.r_star_cycle = float(r_star_cycle)
+        self.deleak_radial_cycle = bool(deleak_radial_cycle)
+        self.lambda_gamma_state = float(lambda_gamma_state)
+        self.lambda_alpha_state = float(lambda_alpha_state)
+        self.lambda_gamma_cycle = (
+            float(lambda_gamma_cycle)
+            if lambda_gamma_cycle is not None
+            else (0.02 if cycle_norm_mode == "natural_identity" else float(lambda_gamma_state))
+        )
+        self.lambda_alpha_cycle = (
+            float(lambda_alpha_cycle)
+            if lambda_alpha_cycle is not None
+            else (0.008 if cycle_norm_mode == "natural_identity" else float(lambda_alpha_state))
+        )
 
         if film_mode == "legacy_hadamard":
-            # Layer-Norm for u_cycle and u_state
             self.norm_cycle = nn.LayerNorm(u_cycle_dim)
             self.norm_state = nn.LayerNorm(u_state_dim)
 
-            # Cycle-Specific Modulators
             self.gamma_cycle = nn.Linear(drug_embed_dim, u_cycle_dim)
             self.beta_cycle = nn.Linear(drug_embed_dim, u_cycle_dim)
-
-            # State-Specific Modulators
             self.gamma_state = nn.Linear(drug_embed_dim, u_state_dim)
             self.beta_state = nn.Linear(drug_embed_dim, u_state_dim)
 
-            # Residual Initializations (1 + gamma) to prevent manifold erasure
             nn.init.zeros_(self.gamma_cycle.weight)
             nn.init.zeros_(self.gamma_cycle.bias)
             nn.init.zeros_(self.gamma_state.weight)
             nn.init.zeros_(self.gamma_state.bias)
-
             nn.init.zeros_(self.beta_cycle.weight)
             nn.init.zeros_(self.beta_cycle.bias)
             nn.init.zeros_(self.beta_state.weight)
             nn.init.zeros_(self.beta_state.bias)
             return
 
-        # --- M7-InvDrop: Stoch-SNR Block-TT WP-FiLM ---
+        # --- M7-InvDrop / v0.4.2 Block-TT WP-FiLM ---
         S = max(1, int(n_samples))
         D_cyc = self.u_cycle_dim
         D_st = self.u_state_dim
@@ -107,11 +299,9 @@ class SplitNaturalShiftFiLM(nn.Module):
         self.eps_iso = float(eps_iso)
         self.ln_eps = float(ln_eps)
 
-        # 1. Variance-Matched Bias-Free LayerNorm (MatchedLN) scale weights (b_LN === 0)
         self.norm_weight_cycle = nn.Parameter(torch.ones(D_cyc))
         self.norm_weight_state = nn.Parameter(torch.ones(D_st))
 
-        # 2. Sample-level metadata & EMA buffers
         self.register_buffer("n_obs_total", torch.tensor(float(max(1, int(n_obs_total))), dtype=torch.float32))
 
         if sample_counts is not None:
@@ -129,6 +319,8 @@ class SplitNaturalShiftFiLM(nn.Module):
         self.register_buffer("ctrl_stats_init", torch.tensor(0.0, dtype=torch.float32))
         self.register_buffer("pool_stats_init", torch.tensor(0.0, dtype=torch.float32))
         self.register_buffer("pert_means_init", torch.zeros(S, dtype=torch.float32))
+        self.register_buffer("pert_r_mean_cycle", torch.ones(S, dtype=torch.float32))
+        self.register_buffer("ctrl_r_mean_cycle", torch.tensor(1.0, dtype=torch.float32))
 
         for ch, D_c in (("cycle", D_cyc), ("state", D_st)):
             self.register_buffer(f"ctrl_qm_var_{ch}", torch.ones(D_c, dtype=torch.float32))
@@ -138,7 +330,6 @@ class SplitNaturalShiftFiLM(nn.Module):
             self.register_buffer(f"pool_cov_{ch}", torch.eye(D_c, dtype=torch.float32))
             self.register_buffer(f"pert_means_{ch}", torch.zeros(S, D_c, dtype=torch.float32))
 
-        # 3. Decoupled perturbation embeddings & Block-TT WP-FiLM heads
         self.emb_gamma = nn.Embedding(S, self.drug_embed_dim)
         self.emb_alpha = nn.Embedding(S, self.drug_embed_dim)
 
@@ -167,11 +358,41 @@ class SplitNaturalShiftFiLM(nn.Module):
         for basis in (self.V_read_cycle, self.U_write_cycle, self.V_read_state, self.U_write_state):
             nn.init.orthogonal_(basis.weight)
 
-    # --- MatchedLN Helpers ---
-    def _normalize_stochastic(self, u: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    @property
+    def ln_cycle_weight(self) -> torch.Tensor:
+        return self.norm_weight_cycle
+
+    @property
+    def ln_state_weight(self) -> torch.Tensor:
+        return self.norm_weight_state
+
+    # --- Normalization Helpers ---
+    def _normalize_stochastic(
+        self,
+        subspace_or_u: Union[str, torch.Tensor],
+        u_or_weight: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if isinstance(subspace_or_u, str):
+            subspace = subspace_or_u
+            u = u_or_weight
+            weight = getattr(self, f"norm_weight_{subspace}")
+        else:
+            u = subspace_or_u
+            weight = u_or_weight if u_or_weight is not None else self.norm_weight_state
+            subspace = "cycle" if weight is self.norm_weight_cycle else "state"
+
+        w = weight.to(device=u.device, dtype=u.dtype)
+        if subspace == "cycle":
+            if self.cycle_norm_mode == "natural_identity":
+                if self.deleak_radial_cycle:
+                    return u / self.r_star_cycle
+                return (u / self.r_star_cycle) * w
+            if self.cycle_norm_mode == "rms_norm":
+                rms = torch.sqrt(u.pow(2).mean(dim=-1, keepdim=True) + self.ln_eps)
+                return (u / rms) * w
+
         mean = u.mean(dim=-1, keepdim=True)
         var = u.var(dim=-1, unbiased=False, keepdim=True)
-        w = weight.to(device=u.device, dtype=u.dtype)
         return ((u - mean) / torch.sqrt(var + self.ln_eps)) * w
 
     def _normalize_matched(
@@ -180,14 +401,25 @@ class SplitNaturalShiftFiLM(nn.Module):
         q_m: torch.Tensor,
         q_v: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        D_c = q_m.shape[-1]
         weight = getattr(self, f"norm_weight_{channel}").to(device=q_m.device, dtype=q_m.dtype)
-        mean = q_m.mean(dim=-1, keepdim=True)
-        var = q_m.var(dim=-1, unbiased=False, keepdim=True)
+        if channel == "cycle":
+            if self.cycle_norm_mode == "natural_identity":
+                if self.deleak_radial_cycle:
+                    return q_m / self.r_star_cycle
+                return (q_m / self.r_star_cycle) * weight
+
         if q_v is not None:
             qv_bar = q_v.to(device=q_m.device, dtype=q_m.dtype).mean(dim=-1, keepdim=True)
         else:
             qv_bar = getattr(self, f"ctrl_qv_mean_{channel}").to(device=q_m.device, dtype=q_m.dtype).mean()
+
+        if channel == "cycle" and self.cycle_norm_mode == "rms_norm":
+            denom = torch.sqrt(q_m.pow(2).mean(dim=-1, keepdim=True) + qv_bar + self.ln_eps)
+            return (q_m / denom) * weight
+
+        D_c = q_m.shape[-1]
+        mean = q_m.mean(dim=-1, keepdim=True)
+        var = q_m.var(dim=-1, unbiased=False, keepdim=True)
         matched_var = var + ((D_c - 1.0) / max(1, D_c)) * qv_bar
         return ((q_m - mean) / torch.sqrt(matched_var + self.ln_eps)) * weight
 
@@ -260,7 +492,6 @@ class SplitNaturalShiftFiLM(nn.Module):
             ("state", q_m_state.detach(), q_v_state.detach(), u_state_match.detach()),
         )
 
-        # 1. Control-sample Pre-LN & MatchedLN statistics
         if n0_b >= 2:
             rho0 = 1.0 - ((1.0 - self.eta0) ** n0_b)
             first_ctrl_init = self.ctrl_stats_init.item() == 0.0
@@ -297,7 +528,6 @@ class SplitNaturalShiftFiLM(nn.Module):
                 ctrl_qv_mean.mul_(1.0 - rho0).add_(rho0 * qv_d[ctrl_mask].mean(dim=0))
                 ctrl_mean.mul_(1.0 - rho0).add_(rho0 * um_d[ctrl_mask].mean(dim=0))
 
-        # 2. Pooled covariance over entire minibatch
         if n_b >= 2:
             rho_pool = 1.0 - ((1.0 - self.eta0) ** n_b)
             first_pool_init = self.pool_stats_init.item() == 0.0
@@ -312,7 +542,6 @@ class SplitNaturalShiftFiLM(nn.Module):
             if first_pool_init:
                 self.pool_stats_init.fill_(1.0)
 
-        # 3. Per-perturbation MatchedLN centroids
         for p_val in torch.unique(sample_idx).tolist():
             pm = sample_idx == p_val
             np_b = int(pm.sum().item())
@@ -338,6 +567,20 @@ class SplitNaturalShiftFiLM(nn.Module):
         sample_idx: torch.Tensor,
         c_film: torch.Tensor,
     ) -> torch.Tensor:
+        if channel == "cycle" and self.cycle_norm_mode == "natural_identity" and self.deleak_radial_cycle and self.training:
+            with torch.no_grad():
+                if u_src.shape[-1] >= 2:
+                    r_b = torch.sqrt(u_src[:, 0].pow(2) + u_src[:, 1].pow(2) + 1e-6)
+                else:
+                    r_b = torch.sqrt(u_src.pow(2).sum(dim=-1) + 1e-6)
+                ctrl_m = c_film.view(-1) < 0.5
+                if int(ctrl_m.sum().item()) >= 2:
+                    self.ctrl_r_mean_cycle.mul_(0.95).add_(0.05 * r_b[ctrl_m].mean())
+                for p_val in torch.unique(sample_idx).tolist():
+                    pm = sample_idx == p_val
+                    if int(pm.sum().item()) >= 2:
+                        self.pert_r_mean_cycle[p_val].mul_(0.90).add_(0.10 * r_b[pm].mean())
+
         mu_hat_all = self.get_shrunk_centroids(channel)
         mu_hat = mu_hat_all[sample_idx]
         u_check = u_src - mu_hat
@@ -351,6 +594,23 @@ class SplitNaturalShiftFiLM(nn.Module):
 
         g_act, g_perp = self.get_snr_gates(channel)
         V_hat, U_hat = self.get_effective_bases(channel, g_act, g_perp)
+
+        if channel == "cycle" and self.cycle_norm_mode == "natural_identity" and self.deleak_radial_cycle:
+            if u_src.shape[-1] == 3:
+                plane_scale = torch.tensor([[1.0, 1.0, 0.05]], device=u_src.device, dtype=u_src.dtype)
+                delta_tan_ring = (g_act.unsqueeze(0) * gamma_par) * u_src
+                delta_perp_ring = F.linear(gamma_perp * F.linear(u_src, V_hat), U_hat)
+                delta_z = c_film * (delta_tan_ring + delta_perp_ring + alpha) * plane_scale
+                r_cur = torch.sqrt(u_src[:, 0:1].pow(2) + u_src[:, 1:2].pow(2) + 1e-6)
+                e_rad = torch.cat([u_src[:, 0:2] / r_cur, torch.zeros_like(r_cur)], dim=-1)
+                dr_leak = (self.pert_r_mean_cycle[sample_idx] - self.ctrl_r_mean_cycle).unsqueeze(-1)
+                u_base_clean = u_src - c_film * (dr_leak * e_rad).detach()
+                return u_base_clean + delta_z
+            else:
+                delta_tan_ring = (g_act.unsqueeze(0) * gamma_par) * u_src
+                delta_perp_ring = F.linear(gamma_perp * F.linear(u_src, V_hat), U_hat)
+                delta_z = c_film * (delta_tan_ring + delta_perp_ring + alpha)
+                return u_src + delta_z
 
         delta_tan = (g_act.unsqueeze(0) * gamma_par) * u_check
         delta_perp = F.linear(gamma_perp * F.linear(u_check, V_hat), U_hat)
@@ -427,14 +687,12 @@ class SplitNaturalShiftFiLM(nn.Module):
                 return z_cycle, z_state, u_cycle_norm, u_state_norm
             return z_cycle, z_state
 
-        # --- M7-InvDrop Forward ---
         sample_idx = sample_or_embed.reshape(-1).long()
         if q_m_cycle is None:
             q_m_cycle = u_cycle
         if q_m_state is None:
             q_m_state = u_state
 
-        # Resolve sample-level control identity clamping & EMA control mask
         if self.is_control_sample.sum() > 0:
             ctrl_mask = self.is_control_sample[sample_idx] > 0.5
             c_film = (1.0 - self.is_control_sample[sample_idx]).unsqueeze(-1).to(dtype=u_cycle.dtype)
@@ -466,8 +724,8 @@ class SplitNaturalShiftFiLM(nn.Module):
                         sample_idx=sample_idx,
                         ctrl_mask=ctrl_mask,
                     )
-            u_cycle_src = self._normalize_stochastic(u_cycle, self.norm_weight_cycle)
-            u_state_src = self._normalize_stochastic(u_state, self.norm_weight_state)
+            u_cycle_src = self._normalize_stochastic("cycle", u_cycle)
+            u_state_src = self._normalize_stochastic("state", u_state)
         else:
             u_cycle_src = self._normalize_matched("cycle", q_m_cycle, q_v=q_v_cycle)
             u_state_src = self._normalize_matched("state", q_m_state, q_v=q_v_state)
@@ -482,8 +740,8 @@ class SplitNaturalShiftFiLM(nn.Module):
     # --- Exact Closed-Form Schur-Product Functional Prior ---
     def compute_film_prior_loss(
         self,
-        lambda_gamma: float = 1.5,
-        lambda_alpha: float = 1.0,
+        lambda_gamma: Optional[float] = None,
+        lambda_alpha: Optional[float] = None,
     ) -> torch.Tensor:
         if self.film_mode != "m7_block_tt":
             return torch.tensor(0.0, device=self.gamma_state.weight.device)
@@ -500,8 +758,24 @@ class SplitNaturalShiftFiLM(nn.Module):
         e_gamma = self.emb_gamma(p_treat)
         e_alpha = self.emb_alpha(p_treat)
 
+        lg_st = float(lambda_gamma) if lambda_gamma is not None else self.lambda_gamma_state
+        la_st = float(lambda_alpha) if lambda_alpha is not None else self.lambda_alpha_state
+        lg_cyc = (
+            self.lambda_gamma_cycle
+            if self.cycle_norm_mode == "natural_identity"
+            else (float(lambda_gamma) if lambda_gamma is not None else self.lambda_gamma_cycle)
+        )
+        la_cyc = (
+            self.lambda_alpha_cycle
+            if self.cycle_norm_mode == "natural_identity"
+            else (float(lambda_alpha) if lambda_alpha is not None else self.lambda_alpha_cycle)
+        )
+
         total_raw = torch.tensor(0.0, device=dev, dtype=torch.float32)
-        for ch, D_c in (("state", self.u_state_dim), ("cycle", self.u_cycle_dim)):
+        for ch, D_c, lg_c, la_c in (
+            ("state", self.u_state_dim, lg_st, la_st),
+            ("cycle", self.u_cycle_dim, lg_cyc, la_cyc),
+        ):
             ctrl_cov = getattr(self, f"ctrl_cov_{ch}")
             pool_cov = getattr(self, f"pool_cov_{ch}")
             eye_c = torch.eye(D_c, device=dev, dtype=ctrl_cov.dtype)
@@ -523,45 +797,152 @@ class SplitNaturalShiftFiLM(nn.Module):
             alpha_energy = (alpha.pow(2)).sum()
 
             total_raw = total_raw + 0.5 * (
-                float(lambda_gamma) * (tan_energy + perp_energy) + float(lambda_alpha) * alpha_energy
+                float(lg_c) * (tan_energy + perp_energy) + float(la_c) * alpha_energy
             )
 
         return total_raw
 
 
+# Alias for SplitWPFiLMTransition
+SplitWPFiLMTransition = SplitNaturalShiftFiLM
+
+
 # ==========================================
-# Bifurcated decoder: cell cycle head + main head
+# Bifurcated / Trifurcated Decoder (v0.4.2 GO-Cylindrical + Gauge-Fixed State + Quarantined OOD)
 # ==========================================
 class BifurcatedDecoder(nn.Module):
+    """Multi-head generative decoder for PertVI.
+
+    Supports:
+      - ``cycle_decoder_mode="linear"`` (v0.3.0 / v0.4.0 default): linear projection of z_cycle
+        masked by ``cycle_gene_mask``.
+      - ``cycle_decoder_mode="cylindrical_harmonic"`` (R3 / R4): 6D cylindrical-harmonic basis
+        phi_cyl(z_cycle) masked by ``cycle_gene_mask`` + Gauge-Fixed Zero-Mean Non-Cycle Logit
+        Centering on ``main_head``.
+      - ``cycle_decoder_mode="go_cylindrical"`` (v0.4.2 default when ``pathway_mask`` is provided):
+        expands z_cycle into 6D cylindrical harmonics phi_cyl(z_cycle), maps to K=6 explicit
+        GO pathway activations z_cycle_go = cyl_to_go(phi_cyl(z_cycle)) in R^6, and decodes onto
+        cycle genes via non-negative pathway-masked weights Softplus(W_go) * M_path^T plus a
+        norm-bounded harmonic residual W_harm * m_cyc.
+      - ``split_ood_decoder=True`` (v0.4.2): separates ``state_head(z_state)`` (masked by
+        ``1 - state_exclude_mask`` and zero-mean centered across non-cycle genes) from
+        ``ood_head(v_ood)`` (bias-free so h_ood(0) === 0 on controls, and hard-masked by
+        ``1 - ood_quarantine_mask`` so d(h_ood,g)/d(v_ood) === 0 on all mitotic genes).
+    """
+
     def __init__(
         self,
         n_input: int,
         n_output: int,
         n_latent_cycle: int,
         cycle_gene_mask: torch.Tensor,
+        n_latent_state: Optional[int] = None,
+        n_latent_ood: Optional[int] = None,
+        pathway_mask: Optional[torch.Tensor] = None,
+        state_exclude_mask: Optional[torch.Tensor] = None,
+        ood_quarantine_mask: Optional[torch.Tensor] = None,
+        cycle_decoder_mode: str = "linear",
+        split_ood_decoder: bool = False,
+        gauge_fix_state: bool = False,
+        harmonic_2theta_scale: float = 0.25,
+        cycle_max_col_norm: Optional[float] = 3.6,
         n_cat_list: list = None,
         n_hidden: int = 128,
+        n_hidden_ood: int = 64,
         n_layers: int = 1,
         max_col_norm: Optional[float] = 2.0,
     ):
         super().__init__()
-        self.n_latent_cycle = n_latent_cycle
-        self.n_latent_main = n_input - n_latent_cycle
-        self.n_genes = n_output
+        self.n_latent_cycle = int(n_latent_cycle)
+        self.n_latent_main = int(n_input - n_latent_cycle)
+        self.n_genes = int(n_output)
         self.max_col_norm = max_col_norm
-        self.register_buffer("cycle_gene_mask", cycle_gene_mask.float())
+        self.cycle_decoder_mode = str(cycle_decoder_mode)
+        self.split_ood_decoder = bool(split_ood_decoder)
+        self.gauge_fix_state = bool(gauge_fix_state) or (
+            self.cycle_decoder_mode in ("cylindrical_harmonic", "go_cylindrical")
+        )
+        self.harmonic_2theta_scale = float(harmonic_2theta_scale)
 
-        # Pathway A: Strictly Linear Cycle Head
-        self.cycle_head = nn.Linear(self.n_latent_cycle, self.n_genes)
+        if n_latent_state is not None and n_latent_ood is not None:
+            self.n_latent_state = int(n_latent_state)
+            self.n_latent_ood = int(n_latent_ood)
+        else:
+            self.n_latent_state = self.n_latent_main
+            self.n_latent_ood = 0
+            self.split_ood_decoder = False
 
-        # Pathway B: Dense Main Head & Batch Bypass
+        cyc_mask_f = torch.as_tensor(cycle_gene_mask, dtype=torch.float32).reshape(-1).clone()
+        self.register_buffer("cycle_gene_mask", cyc_mask_f)
+
+        if state_exclude_mask is not None:
+            st_excl_f = torch.as_tensor(state_exclude_mask, dtype=torch.float32).reshape(-1).clone()
+        else:
+            st_excl_f = cyc_mask_f.clone()
+        self.register_buffer("state_exclude_mask", st_excl_f)
+
+        if ood_quarantine_mask is not None:
+            ood_quar_f = torch.as_tensor(ood_quarantine_mask, dtype=torch.float32).reshape(-1).clone()
+        else:
+            ood_quar_f = cyc_mask_f.clone()
+        self.register_buffer("ood_quarantine_mask", ood_quar_f)
+
+        # --- Pathway A: Cell-Cycle Head ---
+        self.has_pathway_mask = pathway_mask is not None
+        if self.has_pathway_mask:
+            M_path = torch.as_tensor(pathway_mask, dtype=torch.float32).clone()
+            self.n_pathways = int(M_path.shape[0])
+            self.register_buffer("pathway_mask", M_path)
+        else:
+            self.n_pathways = 0
+            self.register_buffer("pathway_mask", None)
+
+        cyl_in_dim = 6 if self.n_latent_cycle == 3 else self.n_latent_cycle
+        if self.cycle_decoder_mode == "go_cylindrical" and self.has_pathway_mask:
+            self.cyl_to_go = nn.Linear(cyl_in_dim, self.n_pathways)
+            with torch.no_grad():
+                if cyl_in_dim == self.n_pathways:
+                    nn.init.eye_(self.cyl_to_go.weight)
+                else:
+                    nn.init.orthogonal_(self.cyl_to_go.weight)
+                nn.init.zeros_(self.cyl_to_go.bias)
+
+            # Non-negative pathway-to-gene weights: Softplus(W_go_raw) * M_path^T
+            self.go_gene_weight_raw = nn.Parameter(
+                torch.full((self.n_genes, self.n_pathways), -1.0)
+            )
+            # Fine-grained cylindrical-harmonic residual head on cycle genes
+            self.cycle_head = nn.Linear(cyl_in_dim, self.n_genes)
+            with torch.no_grad():
+                self.cycle_head.weight.mul_(cyc_mask_f.unsqueeze(1))
+            if cycle_max_col_norm is not None and float(cycle_max_col_norm) > 0.0:
+                register_parametrization(
+                    self.cycle_head,
+                    "weight",
+                    MaxColNorm(max_col_norm=float(cycle_max_col_norm)),
+                )
+        elif self.cycle_decoder_mode == "cylindrical_harmonic":
+            self.cycle_head = nn.Linear(cyl_in_dim, self.n_genes)
+            with torch.no_grad():
+                self.cycle_head.weight.mul_(cyc_mask_f.unsqueeze(1))
+            if cycle_max_col_norm is not None and float(cycle_max_col_norm) > 0.0:
+                register_parametrization(
+                    self.cycle_head,
+                    "weight",
+                    MaxColNorm(max_col_norm=float(cycle_max_col_norm)),
+                )
+        else:
+            self.cycle_head = nn.Linear(self.n_latent_cycle, self.n_genes)
+
+        # --- Pathway B: State / Main Head & Batch Bypass ---
         self.use_batch = n_cat_list is not None and len(n_cat_list) > 0
+        state_core_dim = self.n_latent_state if self.split_ood_decoder else self.n_latent_main
         if self.use_batch:
             self.batch_embed = nn.Embedding(n_cat_list[0], 16)
-            main_in_dim = self.n_latent_main + 16
-            self.batch_gene_bias = nn.Linear(16, self.n_genes)  # Batch bypass for cycle genes
+            main_in_dim = state_core_dim + 16
+            self.batch_gene_bias = nn.Linear(16, self.n_genes)
         else:
-            main_in_dim = self.n_latent_main
+            main_in_dim = state_core_dim
 
         layers = []
         for _ in range(n_layers):
@@ -581,26 +962,131 @@ class BifurcatedDecoder(nn.Module):
         self.main_head = nn.Linear(n_hidden, self.n_genes)
         self.px_dropout_decoder = nn.Linear(n_hidden, self.n_genes)
 
-    def forward(self, dispersion: str, z: torch.Tensor, library: torch.Tensor, batch_index: torch.Tensor = None):
-        z_cycle = z[:, :self.n_latent_cycle]
-        z_main = z[:, self.n_latent_cycle:]
+        # --- Pathway C: Dedicated Quarantined OOD Head (when split_ood_decoder=True) ---
+        if self.split_ood_decoder and self.n_latent_ood > 0:
+            self.ood_hidden = nn.Sequential(
+                nn.Linear(self.n_latent_ood, int(n_hidden_ood), bias=False),
+                nn.ReLU(),
+            )
+            if max_col_norm is not None and float(max_col_norm) > 0.0:
+                register_parametrization(
+                    self.ood_hidden[0],
+                    "weight",
+                    MaxColNorm(max_col_norm=float(max_col_norm)),
+                )
+            self.ood_head = nn.Linear(int(n_hidden_ood), self.n_genes, bias=False)
+            with torch.no_grad():
+                self.ood_head.weight.mul_((1.0 - ood_quar_f).unsqueeze(1))
 
-        if self.use_batch and batch_index is not None:
-            b_embed = self.batch_embed(batch_index.squeeze(-1))
-            z_main = torch.cat([z_main, b_embed], dim=-1)
-            h_batch = self.batch_gene_bias(b_embed)
+    def compute_go_pathway_coordinates(self, cycle_latent: torch.Tensor) -> torch.Tensor:
+        """Maps a 3D cycle latent (u_cycle_src or z_cycle) to K=6 explicit GO pathway coordinates."""
+        phi = expand_cylindrical_harmonics(
+            cycle_latent,
+            harmonic_2theta_scale=self.harmonic_2theta_scale,
+        )
+        if self.cycle_decoder_mode == "go_cylindrical" and self.has_pathway_mask:
+            return self.cyl_to_go(phi)
+        return phi
+
+    def decode_cycle_logits(self, z_cycle: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Computes h_cycle and (if go_cylindrical) the K=6 GO pathway activations z_cycle_go."""
+        cyc_mask_1d = self.cycle_gene_mask.float()
+        if self.cycle_decoder_mode == "go_cylindrical" and self.has_pathway_mask:
+            phi_cyl = expand_cylindrical_harmonics(
+                z_cycle,
+                harmonic_2theta_scale=self.harmonic_2theta_scale,
+            )
+            z_cycle_go = self.cyl_to_go(phi_cyl)
+            M_path_t = self.pathway_mask.t().to(device=z_cycle.device, dtype=z_cycle.dtype)  # (G, K)
+            p_counts = M_path_t.sum(dim=1, keepdim=True).clamp(min=1.0)
+            pos_go_weight = (F.softplus(self.go_gene_weight_raw) * M_path_t) / p_counts
+            h_go = F.linear(z_cycle_go, pos_go_weight)
+
+            masked_res_w = self.cycle_head.weight * cyc_mask_1d.unsqueeze(1)
+            masked_res_b = self.cycle_head.bias * cyc_mask_1d
+            h_res = F.linear(phi_cyl, masked_res_w, masked_res_b)
+            return h_go + h_res, z_cycle_go
+        elif self.cycle_decoder_mode == "cylindrical_harmonic":
+            phi_cyl = expand_cylindrical_harmonics(
+                z_cycle,
+                harmonic_2theta_scale=self.harmonic_2theta_scale,
+            )
+            masked_cycle_weight = self.cycle_head.weight * cyc_mask_1d.unsqueeze(1)
+            masked_cycle_bias = self.cycle_head.bias * cyc_mask_1d
+            h_cycle = F.linear(phi_cyl, masked_cycle_weight, masked_cycle_bias)
+            return h_cycle, None
         else:
-            h_batch = 0.0
+            masked_cycle_weight = self.cycle_head.weight * cyc_mask_1d.unsqueeze(1)
+            masked_cycle_bias = self.cycle_head.bias * cyc_mask_1d
+            h_cycle = F.linear(z_cycle, masked_cycle_weight, masked_cycle_bias)
+            return h_cycle, None
 
-        # Hard Mask implementation
-        masked_cycle_weight = self.cycle_head.weight * self.cycle_gene_mask.unsqueeze(1)
-        masked_cycle_bias = self.cycle_head.bias * self.cycle_gene_mask
-        h_cycle = F.linear(z_cycle, masked_cycle_weight, masked_cycle_bias)
+    def forward(
+        self,
+        dispersion: str,
+        z: torch.Tensor,
+        library: torch.Tensor,
+        batch_index: Optional[torch.Tensor] = None,
+    ):
+        z_cycle = z[:, : self.n_latent_cycle]
+        h_cycle, _ = self.decode_cycle_logits(z_cycle)
 
-        h_hidden = self.main_hidden(z_main)
-        h_main = self.main_head(h_hidden)
+        if self.split_ood_decoder and self.n_latent_ood > 0:
+            z_state = z[:, self.n_latent_cycle : self.n_latent_cycle + self.n_latent_state]
+            v_ood = z[:, self.n_latent_cycle + self.n_latent_state :]
+            if self.use_batch and batch_index is not None:
+                b_embed = self.batch_embed(batch_index.squeeze(-1))
+                z_state_in = torch.cat([z_state, b_embed], dim=-1)
+                h_batch = self.batch_gene_bias(b_embed)
+            else:
+                z_state_in = z_state
+                h_batch = 0.0
 
-        h_total = h_cycle + h_main + h_batch
+            h_hidden = self.main_hidden(z_state_in)
+            h_state_raw = self.main_head(h_hidden)
+
+            if self.gauge_fix_state:
+                non_st_mask = (1.0 - self.state_exclude_mask.float()).unsqueeze(0)
+                n_non_st = non_st_mask.sum().clamp(min=1.0)
+                h_state_mean = (h_state_raw * non_st_mask).sum(dim=-1, keepdim=True) / n_non_st
+                h_state = (h_state_raw - h_state_mean) * non_st_mask
+            else:
+                h_state = h_state_raw
+
+            non_quar_mask = (1.0 - self.ood_quarantine_mask.float()).unsqueeze(1)
+            masked_ood_w = self.ood_head.weight * non_quar_mask
+            h_ood_hid = self.ood_hidden(v_ood)
+            h_ood_raw = F.linear(h_ood_hid, masked_ood_w)
+            if self.gauge_fix_state:
+                non_quar_1d = (1.0 - self.ood_quarantine_mask.float()).unsqueeze(0)
+                n_non_quar = non_quar_1d.sum().clamp(min=1.0)
+                h_ood_mean = (h_ood_raw * non_quar_1d).sum(dim=-1, keepdim=True) / n_non_quar
+                h_ood = (h_ood_raw - h_ood_mean) * non_quar_1d
+            else:
+                h_ood = h_ood_raw
+
+            h_total = h_cycle + h_state + h_ood + h_batch
+        else:
+            z_main = z[:, self.n_latent_cycle :]
+            if self.use_batch and batch_index is not None:
+                b_embed = self.batch_embed(batch_index.squeeze(-1))
+                z_main = torch.cat([z_main, b_embed], dim=-1)
+                h_batch = self.batch_gene_bias(b_embed)
+            else:
+                h_batch = 0.0
+
+            h_hidden = self.main_hidden(z_main)
+            h_main_raw = self.main_head(h_hidden)
+
+            if self.gauge_fix_state:
+                non_st_mask = (1.0 - self.state_exclude_mask.float()).unsqueeze(0)
+                n_non_st = non_st_mask.sum().clamp(min=1.0)
+                h_main_mean = (h_main_raw * non_st_mask).sum(dim=-1, keepdim=True) / n_non_st
+                h_main = (h_main_raw - h_main_mean) * non_st_mask
+            else:
+                h_main = h_main_raw
+
+            h_total = h_cycle + h_main + h_batch
 
         px_scale = F.softmax(h_total, dim=-1)
         px_rate = torch.exp(library) * px_scale
@@ -620,10 +1106,28 @@ class PertVI_Inference(nn.Module):
         n_latent_cycle: int = 3,
         n_latent_state: int = 20,
         n_latent_ood: int = 10,
-        ood_dropout_rate: float = 0.3,
-        basal_gene_dropout_rate: float = 0.15,
+        ood_dropout_rate: float = 0.0,
+        basal_gene_dropout_rate: float = 0.05,
+        ood_sub_dropout_rate: float = 0.05,
+        selective_cycle_input: bool = True,
+        cycle_encoder_mode: str = "standard",
+        cycle_norm_mode: str = "matched_ln",
+        r_star_cycle: float = 1.0,
+        deleak_radial_cycle: bool = False,
+        direct_pathway_latent: bool = False,
+        n_hidden_per_pathway: int = 16,
+        dropout_rate: float = 0.1,
+        cycle_gene_mask: Optional[torch.Tensor] = None,
+        state_exclude_mask: Optional[torch.Tensor] = None,
+        ood_quarantine_mask: Optional[torch.Tensor] = None,
+        pathway_mask: Optional[torch.Tensor] = None,
         drug_embed_dim: int = 16,
         film_mode: str = "m7_block_tt",
+        transition_mode: Optional[str] = None,
+        lambda_gamma_state: float = 1.5,
+        lambda_alpha_state: float = 1.0,
+        lambda_gamma_cycle: Optional[float] = None,
+        lambda_alpha_cycle: Optional[float] = None,
         rank_gamma: int = 16,
         tau_snr: float = 1.5,
         m0_shrink: float = 10.0,
@@ -634,23 +1138,88 @@ class PertVI_Inference(nn.Module):
         is_control_sample: Optional[torch.Tensor] = None,
     ):
         super().__init__()
+        if transition_mode is not None:
+            film_mode = transition_mode
         self.film_mode = film_mode
+        self.cycle_encoder_mode = str(cycle_encoder_mode)
+        self.selective_cycle_input = bool(selective_cycle_input)
+        self.basal_gene_dropout_rate = float(basal_gene_dropout_rate)
+        self.ood_sub_dropout_rate = float(ood_sub_dropout_rate)
+        self.ood_dropout_rate = float(ood_dropout_rate)
+        self.dropout_rate = float(dropout_rate)
 
-        # --- Basal Input Gene Masking (applied exclusively to encoder_cycle & encoder_state) ---
-        self.basal_gene_dropout = nn.Dropout(float(basal_gene_dropout_rate))
+        if cycle_gene_mask is not None:
+            cyc_t = torch.as_tensor(cycle_gene_mask, dtype=torch.float32).reshape(-1).clone()
+            self.register_buffer("cycle_gene_mask", cyc_t, persistent=False)
+        else:
+            self.register_buffer("cycle_gene_mask", None, persistent=False)
+
+        if state_exclude_mask is not None:
+            st_excl_t = torch.as_tensor(state_exclude_mask, dtype=torch.float32).reshape(-1).clone()
+            self.register_buffer("state_exclude_mask", st_excl_t, persistent=False)
+        else:
+            self.register_buffer(
+                "state_exclude_mask",
+                self.cycle_gene_mask.clone() if self.cycle_gene_mask is not None else None,
+                persistent=False,
+            )
+
+        if ood_quarantine_mask is not None:
+            ood_quar_t = torch.as_tensor(ood_quarantine_mask, dtype=torch.float32).reshape(-1).clone()
+            self.register_buffer("ood_quarantine_mask", ood_quar_t, persistent=False)
+        else:
+            self.register_buffer(
+                "ood_quarantine_mask",
+                self.cycle_gene_mask.clone() if self.cycle_gene_mask is not None else None,
+                persistent=False,
+            )
+
+        # --- Selective Basal Input Gene Masking & Nested OOD Sub-Mask ---
+        self.basal_gene_dropout = (
+            nn.Dropout(p=self.basal_gene_dropout_rate)
+            if self.basal_gene_dropout_rate > 0.0
+            else nn.Identity()
+        )
+        self.ood_sub_dropout = (
+            nn.Dropout(p=self.ood_sub_dropout_rate)
+            if self.ood_sub_dropout_rate > 0.0
+            else nn.Identity()
+        )
+
+        p_hid_cycle = (
+            0.0
+            if (self.selective_cycle_input and self.cycle_gene_mask is not None)
+            else self.dropout_rate
+        )
+        self.p_hid_cycle = p_hid_cycle
+        self.p_hid_state = self.dropout_rate
 
         # --- Dual Encoders for Sample-Unaware (u) Spaces ---
-        self.encoder_cycle = Encoder(
-            n_input=n_input,
-            n_output=n_latent_cycle,
-            n_hidden=128,
-            n_layers=2,
-        )
+        if self.cycle_encoder_mode == "go_pathway" and pathway_mask is not None:
+            self.encoder_cycle = PathwayCycleEncoder(
+                n_input=n_input,
+                pathway_mask=pathway_mask,
+                n_output=n_latent_cycle,
+                n_hidden_per_pathway=n_hidden_per_pathway,
+                n_hidden=128,
+                dropout_rate=p_hid_cycle,
+                direct_pathway_latent=direct_pathway_latent,
+            )
+        else:
+            self.encoder_cycle = Encoder(
+                n_input=n_input,
+                n_output=n_latent_cycle,
+                n_hidden=128,
+                n_layers=2,
+                dropout_rate=p_hid_cycle,
+            )
+
         self.encoder_state = Encoder(
             n_input=n_input,
             n_output=n_latent_state,
             n_hidden=128,
             n_layers=2,
+            dropout_rate=self.dropout_rate,
         )
 
         if film_mode == "legacy_hadamard":
@@ -662,6 +1231,7 @@ class PertVI_Inference(nn.Module):
             n_output=n_latent_ood,
             n_hidden=128,
             n_layers=1,
+            dropout_rate=self.dropout_rate,
         )
 
         # --- Encoders to learn library size ---
@@ -679,6 +1249,13 @@ class PertVI_Inference(nn.Module):
             drug_embed_dim=drug_embed_dim,
             n_samples=n_samples,
             film_mode=film_mode,
+            cycle_norm_mode=cycle_norm_mode,
+            r_star_cycle=r_star_cycle,
+            deleak_radial_cycle=deleak_radial_cycle,
+            lambda_gamma_state=lambda_gamma_state,
+            lambda_alpha_state=lambda_alpha_state,
+            lambda_gamma_cycle=lambda_gamma_cycle,
+            lambda_alpha_cycle=lambda_alpha_cycle,
             rank_gamma=rank_gamma,
             tau_snr=tau_snr,
             m0_shrink=m0_shrink,
@@ -690,7 +1267,11 @@ class PertVI_Inference(nn.Module):
         )
 
         # --- The OOD dropout ---
-        self.ood_dropout = nn.Dropout(ood_dropout_rate)
+        self.ood_dropout = nn.Dropout(self.ood_dropout_rate)
+
+    @property
+    def transition(self) -> SplitNaturalShiftFiLM:
+        return self.split_film_transition
 
     def forward(
         self,
@@ -701,13 +1282,43 @@ class PertVI_Inference(nn.Module):
         """
         x: Raw log-normalized counts tensor
         """
-        # Basal encoders receive expectation-preserving gene-masked x_basal; OOD & library receive unmasked x
-        x_basal = self.basal_gene_dropout(x)
+        if self.cycle_gene_mask is not None and self.selective_cycle_input:
+            cyc_mask = self.cycle_gene_mask.to(x.device, dtype=x.dtype).unsqueeze(0)
+            st_excl = (
+                self.state_exclude_mask.to(x.device, dtype=x.dtype).unsqueeze(0)
+                if self.state_exclude_mask is not None
+                else cyc_mask
+            )
+            ood_quar = (
+                self.ood_quarantine_mask.to(x.device, dtype=x.dtype).unsqueeze(0)
+                if self.ood_quarantine_mask is not None
+                else cyc_mask
+            )
+            G_total = float(x.shape[-1])
+            G_cyc = float(cyc_mask.sum().clamp(min=1.0).item())
+            scale_cyc = math.sqrt(G_total / G_cyc)
+            x_cycle = (x * cyc_mask) * scale_cyc
+            x_non_cycle = x * (1.0 - st_excl)
+            x_state = self.basal_gene_dropout(x_non_cycle)
+            x_ood = self.ood_sub_dropout(x_state * (1.0 - ood_quar))
+        else:
+            x_cycle = x
+            x_state = self.basal_gene_dropout(x)
+            x_ood = self.ood_sub_dropout(x_state)
 
         # Extract Latents
-        q_m_cycle, q_v_cycle, u_cycle = self.encoder_cycle(x_basal)
-        q_m_state, q_v_state, u_state = self.encoder_state(x_basal)
-        q_m_ood, q_v_ood, v_ood = self.encoder_ood(x)
+        if isinstance(self.encoder_cycle, PathwayCycleEncoder):
+            q_m_cycle, q_v_cycle, u_cycle, u_cycle_go_enc = self.encoder_cycle(
+                x_cycle, return_go_scores=True
+            )
+            emp_go_scores = self.encoder_cycle.compute_empirical_go_scores(x * cyc_mask if (self.cycle_gene_mask is not None and self.selective_cycle_input) else x)
+        else:
+            q_m_cycle, q_v_cycle, u_cycle = self.encoder_cycle(x_cycle)
+            u_cycle_go_enc = None
+            emp_go_scores = None
+
+        q_m_state, q_v_state, u_state = self.encoder_state(x_state)
+        q_m_ood, q_v_ood, v_ood = self.encoder_ood(x_ood)
 
         # FiLM Transition
         u_base = torch.cat([u_cycle, u_state], dim=-1)
@@ -731,25 +1342,29 @@ class PertVI_Inference(nn.Module):
                 return_src=True,
             )
             z_base = torch.cat([z_cycle, z_state], dim=-1)
-            # Exact learned FiLM displacement in MatchedLN space
             z_shift = z_base - torch.cat([u_cycle_src, u_state_src], dim=-1)
 
-        # Composition with Information Dropout on OOD
+        # Composition with Information Dropout on OOD (deterministic q_m_ood in eval mode)
         v_ood_dropped = self.ood_dropout(v_ood)
+        v_ood_for_z = (
+            v_ood_dropped
+            if (self.training or self.ood_dropout_rate > 0.0)
+            else q_m_ood
+        )
 
         # Final composition
-        z_final = torch.cat([z_base, v_ood_dropped], dim=-1)
+        z_final = torch.cat([z_base, v_ood_for_z], dim=-1)
 
         # Library Size
-        empirical_counts = torch.clamp(x.sum(dim=-1, keepdim=True), min=1.0)  # Calculate the reality (empirical sum)
+        empirical_counts = torch.clamp(x.sum(dim=-1, keepdim=True), min=1.0)
         empirical_lib_log = torch.log(empirical_counts)
-        q_lib_params = self.encoder_library(x)  # Let the network guess a small TWEAK, not the absolute number
+        q_lib_params = self.encoder_library(x)
         q_m_lib = empirical_lib_log + q_lib_params[:, 0:1]
-        q_v_lib_raw = torch.clamp(q_lib_params[:, 1:2], min=-5.0, max=2.0)  # Tame the variance
+        q_v_lib_raw = torch.clamp(q_lib_params[:, 1:2], min=-5.0, max=2.0)
         q_v_lib = torch.exp(q_v_lib_raw) + 1e-4
-        library_log = q_m_lib + torch.sqrt(q_v_lib) * torch.randn_like(q_m_lib)  # Sample the final latent library size
+        library_log = q_m_lib + torch.sqrt(q_v_lib) * torch.randn_like(q_m_lib)
 
-        return {
+        out = {
             "u_cycle": u_cycle,
             "u_state": u_state,
             "u_cycle_src": u_cycle_src,
@@ -771,3 +1386,8 @@ class PertVI_Inference(nn.Module):
             "q_v_lib": q_v_lib,
             "library_log": library_log,
         }
+        if u_cycle_go_enc is not None:
+            out["u_cycle_go_enc"] = u_cycle_go_enc
+        if emp_go_scores is not None:
+            out["emp_go_scores"] = emp_go_scores
+        return out
