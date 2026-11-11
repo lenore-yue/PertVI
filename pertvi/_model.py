@@ -87,6 +87,7 @@ class PertVITrainingPlan(TrainingPlan):
 class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
     _loading_legacy_ckpt: bool = False
     _loading_v040_ckpt: bool = False
+    _loading_legacy_cyl_ckpt: bool = False
 
     def __init__(
         self,
@@ -120,8 +121,14 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         lambda_soft: Optional[float] = None,
         floor_lambda_ood: Optional[float] = None,
         max_lambda_ood: Optional[float] = None,
+        beta_cyc: Optional[float] = None,
+        beta_cycle_null: float = 3.0,
+        sigma_cycle_z: Optional[float] = None,
+        harmonic_basis_mode: Optional[str] = None,
+        r0_smooth: float = 0.45,
         lambda_drug_cycle_align: Optional[float] = None,
-        lambda_go_pathway: float = 5.0,
+        lambda_go_pathway: float = 2.5,
+        lambda_ribbon_2d: float = 25.0,
         **model_kwargs,
     ):
         super().__init__(adata)
@@ -146,6 +153,9 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             cycle_norm_mode = "matched_ln"
             cycle_prior_mode = "standard_normal"
             selective_cycle_input = False
+        elif getattr(self.__class__, "_loading_legacy_cyl_ckpt", False):
+            if harmonic_basis_mode is None:
+                harmonic_basis_mode = "legacy_cylindrical"
 
         if cycle_gene_mask_key not in adata.var.columns:
             raise ValueError(f"Column '{cycle_gene_mask_key}' not found in adata.var.")
@@ -240,8 +250,14 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             floor_lambda_ood = 10.0 if use_go_arch else 5.0
         if max_lambda_ood is None:
             max_lambda_ood = 100.0 if use_go_arch else 50.0
+        if beta_cyc is None:
+            beta_cyc = 0.30 if use_go_arch else 0.50
+        if sigma_cycle_z is None:
+            sigma_cycle_z = 0.03 if use_go_arch else 0.05
+        if harmonic_basis_mode is None:
+            harmonic_basis_mode = "soft_unit_ribbon"
         if lambda_drug_cycle_align is None:
-            lambda_drug_cycle_align = 25.0 if use_go_arch else 0.0
+            lambda_drug_cycle_align = 0.0
 
         self.module = PertVIModule(
             n_input=self.summary_stats.n_vars,
@@ -264,6 +280,11 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             film_mode=film_mode,
             cycle_norm_mode=cycle_norm_mode,
             cycle_prior_mode=cycle_prior_mode,
+            beta_cyc=beta_cyc,
+            beta_cycle_null=beta_cycle_null,
+            sigma_cycle_z=sigma_cycle_z,
+            harmonic_basis_mode=harmonic_basis_mode,
+            r0_smooth=r0_smooth,
             deleak_radial_cycle=deleak_radial_cycle,
             selective_cycle_input=selective_cycle_input,
             ood_all_cells_hsic=ood_all_cells_hsic,
@@ -282,6 +303,7 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             max_lambda_ood=max_lambda_ood,
             lambda_drug_cycle_align=lambda_drug_cycle_align,
             lambda_go_pathway=lambda_go_pathway if use_go_arch else 0.0,
+            lambda_ribbon_2d=lambda_ribbon_2d if use_go_arch else 0.0,
             **model_kwargs,
         )
         self._model_summary_string = (
@@ -302,6 +324,7 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         pt_path = os.path.join(dir_path, f"{prefix or ''}model.pt")
         is_legacy = False
         is_v040 = False
+        is_legacy_cyl = False
         if os.path.exists(pt_path):
             ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
             sd = ckpt.get("model_state_dict", {})
@@ -309,8 +332,11 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
                 is_legacy = True
             elif "inference_net.encoder_cycle.pathway_linear.weight" not in sd:
                 is_v040 = True
+            elif "generative_net.cyl_to_go.bias" in sd:
+                is_legacy_cyl = True
         cls._loading_legacy_ckpt = is_legacy
         cls._loading_v040_ckpt = is_v040
+        cls._loading_legacy_cyl_ckpt = is_legacy_cyl
         try:
             return super().load(
                 dir_path,
@@ -323,6 +349,7 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         finally:
             cls._loading_legacy_ckpt = False
             cls._loading_v040_ckpt = False
+            cls._loading_legacy_cyl_ckpt = False
 
     @classmethod
     def setup_anndata(

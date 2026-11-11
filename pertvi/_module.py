@@ -151,13 +151,19 @@ class PertVIModule(BaseModuleClass):
         transition_mode: Optional[str] = None,
         cycle_norm_mode: str = "matched_ln",
         cycle_prior_mode: str = "standard_normal",
+        beta_cyc: Optional[float] = None,
+        beta_cycle_z: float = 1.0,
+        beta_cycle_null: float = 3.0,
         sigma_cycle_xy: float = 1.0,
-        sigma_cycle_z: float = 0.05,
+        sigma_cycle_z: float = 0.03,
         r0_ring: float = 1.02,
         tau_hole: float = 0.0,
         lambda_circ: float = 0.0,
         lambda_drug_cycle_align: float = 0.0,
-        lambda_go_pathway: float = 5.0,
+        lambda_go_pathway: float = 2.5,
+        lambda_ribbon_2d: float = 25.0,
+        harmonic_basis_mode: str = "soft_unit_ribbon",
+        r0_smooth: float = 0.45,
         deleak_radial_cycle: bool = False,
         selective_cycle_input: bool = False,
         ood_all_cells_hsic: bool = False,
@@ -209,6 +215,12 @@ class PertVIModule(BaseModuleClass):
         self.split_ood_decoder = bool(split_ood_decoder)
         self.cycle_norm_mode = str(cycle_norm_mode)
         self.cycle_prior_mode = str(cycle_prior_mode)
+        if beta_cyc is None:
+            self.beta_cyc = 0.30 if self.cycle_prior_mode == "anisotropic_normal" else 0.50
+        else:
+            self.beta_cyc = float(beta_cyc)
+        self.beta_cycle_z = float(beta_cycle_z)
+        self.beta_cycle_null = float(beta_cycle_null)
         self.sigma_cycle_xy = float(sigma_cycle_xy)
         self.sigma_cycle_z = float(sigma_cycle_z)
         self.r0_ring = float(r0_ring)
@@ -216,6 +228,9 @@ class PertVIModule(BaseModuleClass):
         self.lambda_circ = float(lambda_circ)
         self.lambda_drug_cycle_align = float(lambda_drug_cycle_align)
         self.lambda_go_pathway = float(lambda_go_pathway)
+        self.lambda_ribbon_2d = float(lambda_ribbon_2d)
+        self.harmonic_basis_mode = str(harmonic_basis_mode)
+        self.r0_smooth = float(r0_smooth)
         self.r_star_cycle = (
             0.5 * (self.r0_ring + ((self.r0_ring ** 2 + 4.0 * self.tau_hole * (self.sigma_cycle_xy ** 2)) ** 0.5))
             if (self.cycle_prior_mode == "annular_ring" and self.tau_hole > 0.0)
@@ -296,6 +311,8 @@ class PertVIModule(BaseModuleClass):
             ood_quarantine_mask=ood_quarantine_mask,
             cycle_decoder_mode=self.cycle_decoder_mode,
             split_ood_decoder=self.split_ood_decoder,
+            harmonic_basis_mode=self.harmonic_basis_mode,
+            r0_smooth=self.r0_smooth,
             n_cat_list=[n_batch] if n_batch > 0 else None,
             n_layers=1,
             n_hidden=128,
@@ -364,7 +381,9 @@ class PertVIModule(BaseModuleClass):
 
         outputs = self.inference_net(x_log, sample_index, is_treated=is_treated)
         if self.cycle_decoder_mode in ("go_cylindrical", "cylindrical_harmonic"):
-            outputs["u_cycle_go"] = self.generative_net.compute_go_pathway_coordinates(outputs["u_cycle_src"])
+            outputs["u_cycle_go"] = self.generative_net.compute_go_pathway_coordinates(
+                outputs["u_cycle_src"].detach()
+            )
             outputs["z_cycle_go"] = self.generative_net.compute_go_pathway_coordinates(outputs["z_cycle"])
         return outputs
 
@@ -430,13 +449,21 @@ class PertVIModule(BaseModuleClass):
         l_drug_cycle = torch.tensor(0.0, device=x.device, dtype=x.dtype)
 
         if self.cycle_prior_mode == "anisotropic_normal" and q_m_cycle.shape[1] == 3:
-            prior_xy = Normal(0.0, self.sigma_cycle_xy)
+            gamma_gate = inference_outputs.get("cycle_reliability_gate")
+            if gamma_gate is not None:
+                g_val = torch.clamp(gamma_gate.detach(), min=0.0, max=1.0)
+                sigma_xy_eff = self.sigma_cycle_xy * torch.sqrt(0.02 + 0.98 * g_val)
+                beta_eff = self.beta_cyc + ((1.0 - g_val).pow(2)) * self.beta_cycle_null
+            else:
+                sigma_xy_eff = self.sigma_cycle_xy
+                beta_eff = self.beta_cyc
+            prior_xy = Normal(0.0, sigma_xy_eff)
             kl_xy = kl(Normal(q_m_cycle[:, :2], torch.sqrt(q_v_cycle[:, :2])), prior_xy).sum(dim=-1)
-            sz2 = self.sigma_cycle_z ** 2
+            sz2 = max(self.sigma_cycle_z ** 2, 1e-8)
             kl_z2 = (q_m_cycle[:, 2].pow(2)) / (2.0 * sz2) + 0.5 * (
                 (q_v_cycle[:, 2] / sz2) - torch.log(q_v_cycle[:, 2] / sz2) - 1.0
             )
-            kl_cycle_weighted = kl_xy + kl_z2
+            kl_cycle_weighted = (beta_eff * kl_xy) + (self.beta_cycle_z * kl_z2)
         elif self.cycle_prior_mode == "annular_ring" and q_m_cycle.shape[1] == 3:
             r12 = torch.sqrt(q_m_cycle[:, 0].pow(2) + q_m_cycle[:, 1].pow(2) + 1e-6)
             l_rad = ((r12 - self.r0_ring).pow(2)) / (2.0 * (self.sigma_cycle_xy ** 2)) - (
@@ -459,9 +486,8 @@ class PertVIModule(BaseModuleClass):
                     c1.mean().pow(2) + s1.mean().pow(2) + 0.5 * (c2.mean().pow(2) + s2.mean().pow(2))
                 )
         else:
-            beta_cyc = 0.5
             kl_cycle = kl(Normal(q_m_cycle, torch.sqrt(q_v_cycle)), prior).sum(dim=-1)
-            kl_cycle_weighted = beta_cyc * kl_cycle
+            kl_cycle_weighted = self.beta_cyc * kl_cycle
 
         if self.lambda_drug_cycle_align > 0.0 and sample_idx is not None:
             r12_all = (
@@ -473,30 +499,62 @@ class PertVIModule(BaseModuleClass):
             n_groups = 0
             for s_val in torch.unique(sample_idx):
                 m_s = sample_idx == s_val
-                if int(m_s.sum().item()) >= 3:
+                if int(m_s.sum().item()) >= 8:
                     r_mean_s = r12_all[m_s].mean()
-                    u_mean_s = q_m_cycle[m_s].mean(dim=0)
-                    l_drug_cycle = l_drug_cycle + ((r_mean_s - r_global).pow(2)) + 0.5 * u_mean_s.pow(2).sum()
+                    l_drug_cycle = l_drug_cycle + ((r_mean_s - r_global).pow(2))
                     n_groups += 1
             if n_groups > 0:
                 l_drug_cycle = self.lambda_drug_cycle_align * (l_drug_cycle / float(n_groups))
 
-        # --- GO Pathway Coordinate Alignment Loss (v0.4.2) ---
+        # --- GO Pathway & Forward Soft-Ribbon Coordinate Alignment Loss (v0.4.2) ---
         l_go_pathway = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         if (
             self.lambda_go_pathway > 0.0
             and "emp_go_scores" in inference_outputs
             and inference_outputs["emp_go_scores"] is not None
         ):
-            emp_go = inference_outputs["emp_go_scores"].detach()
-            emp_go_std = emp_go / (emp_go.std(dim=0, keepdim=True) + 1e-5)
+            emp_go_target = inference_outputs["emp_go_scores"].detach()
             if "u_cycle_go" in inference_outputs and inference_outputs["u_cycle_go"] is not None:
                 u_go = inference_outputs["u_cycle_go"]
-                l_go_pathway = l_go_pathway + F.mse_loss(u_go, emp_go_std)
+                l_go_pathway = l_go_pathway + F.mse_loss(u_go, emp_go_target)
             if "u_cycle_go_enc" in inference_outputs and inference_outputs["u_cycle_go_enc"] is not None:
                 u_go_enc = inference_outputs["u_cycle_go_enc"]
-                l_go_pathway = l_go_pathway + 0.5 * F.mse_loss(u_go_enc, emp_go_std)
+                l_go_pathway = l_go_pathway + 0.5 * F.mse_loss(u_go_enc, emp_go_target)
             l_go_pathway = self.lambda_go_pathway * l_go_pathway
+            if (
+                self.lambda_ribbon_2d > 0.0
+                and q_m_cycle.shape[1] == 3
+                and "emp_ribbon_2d" in inference_outputs
+                and inference_outputs["emp_ribbon_2d"] is not None
+            ):
+                u_rib_target = inference_outputs["emp_ribbon_2d"].detach()
+                mu_xy = q_m_cycle[:, :2]
+                gamma_rib = inference_outputs.get("cycle_reliability_gate")
+                g_rib = (
+                    torch.clamp(gamma_rib.detach(), min=0.0, max=1.0)
+                    if gamma_rib is not None
+                    else torch.tensor(1.0, device=x.device, dtype=x.dtype)
+                )
+                r_mu = torch.sqrt(mu_xy.pow(2).sum(dim=-1) + 1e-6)
+                r_rib = torch.sqrt(u_rib_target.pow(2).sum(dim=-1) + 1e-6)
+                l_rad_rib = 0.5 * (1.8 * self.lambda_ribbon_2d) * ((r_mu - r_rib).pow(2).mean())
+                mu_sg = mu_xy.detach()
+                r2_sg = mu_sg.pow(2).sum(dim=-1, keepdim=True)
+                mu_tan = mu_xy - (((mu_xy - mu_sg) * mu_sg).sum(dim=-1, keepdim=True) / (r2_sg + 1e-6)) * mu_sg
+                u_mu_dir = mu_tan / torch.sqrt(r2_sg + 0.04)
+                u_rib_dir = u_rib_target / torch.sqrt(u_rib_target.pow(2).sum(dim=-1, keepdim=True) + 0.04)
+                l_ang_rib = 0.5 * (2.0 * self.lambda_ribbon_2d) * (
+                    (u_mu_dir - u_rib_dir).pow(2).sum(dim=-1).mean()
+                )
+                l_euc_null = 0.5 * (1.8 * self.lambda_ribbon_2d) * (
+                    (mu_xy - u_rib_target).pow(2).sum(dim=-1).mean()
+                )
+                w_polar = torch.clamp((g_rib - 0.15) / 0.35, min=0.0, max=1.0)
+                l_go_pathway = (
+                    l_go_pathway
+                    + w_polar * (l_rad_rib + l_ang_rib)
+                    + (1.0 - w_polar) * l_euc_null
+                )
 
         kl_local_unaggregated = kl_cycle_weighted + kl_state + kl_ood_final + kl_library
 

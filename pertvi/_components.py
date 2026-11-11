@@ -30,27 +30,114 @@ class MaxColNorm(nn.Module):
 # ==========================================
 def expand_cylindrical_harmonics(
     z_cycle: torch.Tensor,
-    harmonic_2theta_scale: float = 0.25,
+    harmonic_2theta_scale: float = 0.75,
     z2_scale: float = 0.05,
+    r0_smooth: float = 0.45,
+    radial_amp_scale: float = 1.0,
+    harmonic_basis_mode: str = "soft_unit_ribbon",
 ) -> torch.Tensor:
-    """Expands a 3D phase-loop coordinate z_cycle = (z_0, z_1, z_2) into a 6D cylindrical-harmonic basis:
-       phi_cyl(z) = [z_0, z_1, z2_scale * z_2, r_12 - 1.0, s_2 * r_12 * cos(2*theta), s_2 * r_12 * sin(2*theta)].
-    If z_cycle has dimension != 3 (e.g., 6D direct pathway mode), returns z_cycle directly.
+    """Expands 3D cylindrical cycle coordinates (z_0, z_1, z_2) into a 6D harmonic basis.
+
+    Modes:
+      - ``soft_unit_ribbon`` (v0.4.2 default): C^infty origin-vanishing soft-unit angular harmonics
+        with Riemannian tangential gradient projection:
+            phi_rib(z) = [z_tan,0 / sqrt(r_sg^2 + r_0^2), z_tan,1 / sqrt(r_sg^2 + r_0^2),
+                          z2_scale * z_2, s_r * r_sg^2 / (r_sg^2 + r_0^2),
+                          s_2 * (z_tan,0^2 - z_tan,1^2) / (r_sg^2 + r_0^2),
+                          s_2 * (2 z_tan,0 z_tan,1) / (r_sg^2 + r_0^2)],
+        where z_tan = z_xy - (<z_xy - z_sg, z_sg> / (r_sg^2 + 1e-6)) z_sg equals z_xy identically
+        in forward evaluation while projecting decoder gradients strictly onto the angular tangent
+        direction e_theta. On the active ribbon (r ~ 1), phi_rib spans the complete 5D trigonometric
+        polynomial space {1, cos(theta), sin(theta), cos(2*theta), sin(2*theta)} on S^1 while
+        vanishing identically at z = 0 on non-cycling/null cohorts.
+      - ``smooth_polynomial``: Unbounded C^infty origin-vanishing polynomial harmonics.
+      - ``legacy_cylindrical``: Earlier v0.4.2 basis [z_0, z_1, z2_scale * z_2, r_12 - 1, c_2, s_2].
     """
     if z_cycle.shape[-1] != 3:
         return z_cycle
-    r_z = torch.sqrt(z_cycle[:, 0:1].pow(2) + z_cycle[:, 1:2].pow(2) + 1e-6)
-    c1 = z_cycle[:, 0:1] / r_z
-    s1 = z_cycle[:, 1:2] / r_z
-    c2 = float(harmonic_2theta_scale) * r_z * (c1.pow(2) - s1.pow(2))
-    s2 = float(harmonic_2theta_scale) * r_z * (2.0 * s1 * c1)
+    if harmonic_basis_mode == "legacy_cylindrical":
+        r_z = torch.sqrt(z_cycle[:, 0:1].pow(2) + z_cycle[:, 1:2].pow(2) + 1e-6)
+        c1 = z_cycle[:, 0:1] / r_z
+        s1 = z_cycle[:, 1:2] / r_z
+        c2 = float(harmonic_2theta_scale) * r_z * (c1.pow(2) - s1.pow(2))
+        s2 = float(harmonic_2theta_scale) * r_z * (2.0 * s1 * c1)
+        return torch.cat(
+            [
+                z_cycle[:, 0:2],
+                float(z2_scale) * z_cycle[:, 2:3],
+                r_z - 1.0,
+                c2,
+                s2,
+            ],
+            dim=-1,
+        )
+
+    z0 = z_cycle[:, 0:1]
+    z1 = z_cycle[:, 1:2]
+    r2 = z0.pow(2) + z1.pow(2)
+
+    if harmonic_basis_mode == "soft_unit_ribbon":
+        r0_sq = max(float(r0_smooth) ** 2, 1e-4)
+        z_xy = z_cycle[:, 0:2]
+        z_sg = z_xy.detach()
+        r2_sg = z_sg.pow(2).sum(dim=-1, keepdim=True)
+        w_tan = r2_sg / (r2_sg + 0.04)
+        rad_proj = w_tan * (((z_xy - z_sg) * z_sg).sum(dim=-1, keepdim=True) / (r2_sg + 1e-6))
+        z_tan = z_xy - rad_proj * z_sg
+        zt0 = z_tan[:, 0:1]
+        zt1 = z_tan[:, 1:2]
+        denom1 = torch.sqrt(r2_sg + r0_sq)
+        denom2 = r2_sg + r0_sq
+        c1_sat = zt0 / denom1
+        s1_sat = zt1 / denom1
+        r_sat = float(radial_amp_scale) * (r2_sg / denom2)
+        c2_sat = float(harmonic_2theta_scale) * (zt0.pow(2) - zt1.pow(2)) / denom2
+        s2_sat = float(harmonic_2theta_scale) * (2.0 * zt0 * zt1) / denom2
+        return torch.cat(
+            [
+                c1_sat,
+                s1_sat,
+                float(z2_scale) * z_cycle[:, 2:3],
+                r_sat,
+                c2_sat,
+                s2_sat,
+            ],
+            dim=-1,
+        )
+
+    if harmonic_basis_mode == "saturating_rational":
+        r0_sq = max(float(r0_smooth) ** 2, 1e-4)
+        denom1 = torch.sqrt(r2 + r0_sq)
+        denom2 = r2 + r0_sq
+        c1_sat = z0 / denom1
+        s1_sat = z1 / denom1
+        r_sat = float(radial_amp_scale) * (r2 / denom2)
+        c2_sat = float(harmonic_2theta_scale) * (z0.pow(2) - z1.pow(2)) / denom2
+        s2_sat = float(harmonic_2theta_scale) * (2.0 * z0 * z1) / denom2
+        return torch.cat(
+            [
+                c1_sat,
+                s1_sat,
+                float(z2_scale) * z_cycle[:, 2:3],
+                r_sat,
+                c2_sat,
+                s2_sat,
+            ],
+            dim=-1,
+        )
+
+    # Default: smooth_polynomial (unbounded C^infty origin-vanishing harmonic basis)
+    r_quad = float(radial_amp_scale) * r2
+    c2_poly = float(harmonic_2theta_scale) * (z0.pow(2) - z1.pow(2))
+    s2_poly = float(harmonic_2theta_scale) * (2.0 * z0 * z1)
     return torch.cat(
         [
-            z_cycle[:, 0:2],
+            z0,
+            z1,
             float(z2_scale) * z_cycle[:, 2:3],
-            r_z - 1.0,
-            c2,
-            s2,
+            r_quad,
+            c2_poly,
+            s2_poly,
         ],
         dim=-1,
     )
@@ -111,6 +198,10 @@ class PathwayCycleEncoder(nn.Module):
         self.register_buffer("pathway_mask", M_path)
         self.register_buffer("expanded_input_mask", expanded_mask)
 
+        M_half_a, M_half_b = self._make_disjoint_split_halves(M_path)
+        self.register_buffer("pathway_mask_half_a", M_half_a, persistent=False)
+        self.register_buffer("pathway_mask_half_b", M_half_b, persistent=False)
+
         total_path_hid = self.n_pathways * self.n_hidden_per_pathway
         self.pathway_linear = nn.Linear(self.n_input, total_path_hid, bias=False)
         with torch.no_grad():
@@ -147,13 +238,170 @@ class PathwayCycleEncoder(nn.Module):
             nn.init.constant_(self.var_encoder.bias, -2.0)
 
         self.last_u_cycle_go_enc: Optional[torch.Tensor] = None
+        self.split_r_gate_tau: float = 0.35
+        self.sig_res_gate_tau: float = 0.42
+        self.register_buffer("ema_r_split", torch.tensor(0.85, dtype=torch.float32), persistent=False)
+        self.register_buffer("ema_sig_res", torch.tensor(0.75, dtype=torch.float32), persistent=False)
+        self.register_buffer("ema_q05", torch.zeros(self.n_pathways, dtype=torch.float32), persistent=False)
+        self.register_buffer("ema_q95", torch.ones(self.n_pathways, dtype=torch.float32), persistent=False)
+        self.register_buffer("ema_go_initialized", torch.tensor(0, dtype=torch.long), persistent=False)
 
-    def compute_empirical_go_scores(self, x_cycle: torch.Tensor) -> torch.Tensor:
-        """Computes the centered empirical GO module averages directly from x_cycle: (N, K)."""
-        M = self.pathway_mask.to(device=x_cycle.device, dtype=x_cycle.dtype)
+    @staticmethod
+    def _make_disjoint_split_halves(M_path: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        union_idx = torch.where(M_path.sum(dim=0) > 0)[0]
+        M_half_a = torch.zeros_like(M_path)
+        M_half_b = torch.zeros_like(M_path)
+        if union_idx.numel() >= 2:
+            M_half_a[:, union_idx[0::2]] = M_path[:, union_idx[0::2]]
+            M_half_b[:, union_idx[1::2]] = M_path[:, union_idx[1::2]]
+        else:
+            M_half_a.copy_(M_path)
+            M_half_b.copy_(M_path)
+        return M_half_a, M_half_b
+
+    @torch.no_grad()
+    def reset_pathway_masks(self, pathway_mask: torch.Tensor) -> None:
+        M_path = torch.as_tensor(
+            pathway_mask, device=self.pathway_mask.device, dtype=self.pathway_mask.dtype
+        )
+        cyc_union = (M_path.sum(dim=0) > 0).float()
+        g_cyc_total = cyc_union.sum().clamp(min=1.0)
+        p_counts = M_path.sum(dim=1, keepdim=True).clamp(min=1.0)
+        scaled_M_path = M_path * torch.sqrt(g_cyc_total / p_counts)
+        expanded_mask = scaled_M_path.repeat_interleave(self.n_hidden_per_pathway, dim=0)
+        self.pathway_mask.copy_(M_path)
+        self.expanded_input_mask.copy_(expanded_mask)
+        M_half_a, M_half_b = self._make_disjoint_split_halves(M_path)
+        self.pathway_mask_half_a.copy_(M_half_a)
+        self.pathway_mask_half_b.copy_(M_half_b)
+        self.pathway_linear.weight.mul_(expanded_mask > 0)
+        self.ema_go_initialized.fill_(0)
+
+    def get_reliability_gate(self) -> float:
+        r_sp = float(self.ema_r_split.item())
+        s_rs = float(self.ema_sig_res.item())
+        g_r = (r_sp ** 4) / ((r_sp ** 4) + (self.split_r_gate_tau ** 4))
+        g_s = (s_rs ** 4) / ((s_rs ** 4) + (self.sig_res_gate_tau ** 4))
+        raw_g = float(g_r * g_s)
+        return float(max(0.0, min(1.0, (raw_g - 0.02) / 0.98)))
+
+    def compute_empirical_go_targets(
+        self, x_full_log: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Computes Split-Half Reliability-Gated GO Pathway & Forward Soft-Ribbon Phase Targets.
+
+        Mathematical Guarantees:
+          1. Library-size normalizes x_full_log = log(1 + counts) to log(1 + CP10k) so low-UMI
+             droplets are not attenuated into the origin hole.
+          2. Evaluates genuine multi-gene cell-cycle coherence via strictly disjoint even/odd
+             cycle-gene split-half correlation r_split and 3-pole dispersion sig_res AFTER
+             quadratic library-size residualization [1, log_lib, log_lib^2], giving gamma_cycle -> 0
+             identically on column-shuffled noise or pure quiescent G0 cohorts.
+          3. Normalizes each GO module k by span_k = max(q95_k - q05_k, 0.85 * max_j(q95_j - q05_j, 0.75))
+             so active cycling phases map to [0, 1] across datasets while absent phases (e.g., M-depleted
+             open C-arcs where G1 and M do not connect) are NEVER artificially stretched to close a loop.
+          4. Applies canonical de-shearing around the biochemically forbidden hysteresis interior
+             (c_S=0.44, c_M=0.42) and smooth rational forward ribbon mapping with adaptive core
+             r0_eff^2 = 0.40^2 + 2.5 * (1 - gamma_cycle)^2 (hollow ribbon when gamma_cycle ~ 1,
+             linear unimodal contraction when gamma_cycle -> 0).
+        """
+        M = self.pathway_mask.to(device=x_full_log.device, dtype=x_full_log.dtype)
         denom = M.sum(dim=1, keepdim=True).clamp(min=1.0).t()  # (1, K)
-        raw_scores = torch.matmul(x_cycle, M.t()) / denom  # (N, K)
-        return raw_scores - raw_scores.mean(dim=0, keepdim=True)
+        counts_est = torch.clamp(torch.expm1(x_full_log), min=0.0)
+        tot_counts = counts_est.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        x_cp10k = torch.log1p(counts_est * (1e4 / tot_counts))
+        s_full = torch.matmul(x_cp10k, M.t()) / denom  # (N, K)
+
+        if (self.training or int(self.ema_go_initialized.item()) == 0) and s_full.shape[0] >= 64:
+            with torch.no_grad():
+                x_cp_f = x_cp10k.float()
+                s_f = s_full.float()
+                M_a = self.pathway_mask_half_a.to(device=x_cp_f.device, dtype=torch.float32)
+                M_b = self.pathway_mask_half_b.to(device=x_cp_f.device, dtype=torch.float32)
+                s_a = torch.matmul(x_cp_f, M_a.t()) / M_a.sum(dim=1, keepdim=True).clamp(min=1.0).t()
+                s_b = torch.matmul(x_cp_f, M_b.t()) / M_b.sum(dim=1, keepdim=True).clamp(min=1.0).t()
+
+                ll = torch.log(tot_counts.float())
+                ll_z = (ll - ll.mean()) / (ll.std() + 1e-6)
+                B_lib = torch.cat([torch.ones_like(ll_z), ll_z, ll_z.pow(2)], dim=1)  # (N, 3)
+                gram = torch.matmul(B_lib.t(), B_lib) + 1e-4 * torch.eye(3, device=B_lib.device, dtype=torch.float32)
+
+                def _res_quad(Y: torch.Tensor) -> torch.Tensor:
+                    coef = torch.linalg.solve(gram, torch.matmul(B_lib.t(), Y))
+                    return Y - torch.matmul(B_lib, coef)
+
+                r_a = _res_quad(s_a)
+                r_b = _res_quad(s_b)
+                r_f = _res_quad(s_f)
+
+                r_ac = r_a - r_a.mean(dim=0, keepdim=True)
+                r_bc = r_b - r_b.mean(dim=0, keepdim=True)
+                valid_ab = (M_a.sum(dim=1) >= 1.0) & (M_b.sum(dim=1) >= 1.0)
+                corr_num = (r_ac * r_bc).mean(dim=0)
+                corr_den = torch.sqrt(r_ac.pow(2).mean(dim=0) * r_bc.pow(2).mean(dim=0) + 1e-10)
+                corrs = torch.clamp(corr_num / corr_den, min=0.0, max=1.0)
+                if bool(valid_ab.any()):
+                    r_split_b = torch.sqrt(corrs[valid_ab].pow(2).mean() + 1e-10)
+                else:
+                    r_split_b = torch.tensor(0.0, device=s_f.device, dtype=torch.float32)
+
+                k_half = max(self.n_pathways // 2, 1)
+                load_r = r_f.mean(dim=-1)
+                sd_r = r_f[:, :k_half].mean(dim=-1) - r_f[:, k_half:].mean(dim=-1)
+                m_g1 = load_r <= torch.quantile(load_r, 0.15)
+                m_s = sd_r >= torch.quantile(sd_r, 0.85)
+                m_m = (-sd_r) >= torch.quantile(-sd_r, 0.85)
+                p_g1 = r_f[m_g1].mean(dim=0) if bool(m_g1.any()) else r_f.mean(dim=0)
+                p_s = r_f[m_s].mean(dim=0) if bool(m_s.any()) else r_f.mean(dim=0)
+                p_m = r_f[m_m].mean(dim=0) if bool(m_m.any()) else r_f.mean(dim=0)
+                mu_r = (p_g1 + p_s + p_m) / 3.0
+                sig_res_b = torch.sqrt(
+                    (((p_g1 - mu_r).pow(2) + (p_s - mu_r).pow(2) + (p_m - mu_r).pow(2)) / 3.0).sum() + 1e-10
+                )
+
+                q05_b = torch.quantile(s_f, 0.05, dim=0)
+                q95_b = torch.quantile(s_f, 0.95, dim=0)
+
+                if int(self.ema_go_initialized.item()) == 0:
+                    self.ema_r_split.copy_(r_split_b)
+                    self.ema_sig_res.copy_(sig_res_b)
+                    self.ema_q05.copy_(q05_b)
+                    self.ema_q95.copy_(q95_b)
+                    self.ema_go_initialized.fill_(1)
+                elif self.training:
+                    self.ema_r_split.mul_(0.95).add_(0.05 * r_split_b)
+                    self.ema_sig_res.mul_(0.95).add_(0.05 * sig_res_b)
+                    self.ema_q05.mul_(0.95).add_(0.05 * q05_b)
+                    self.ema_q95.mul_(0.95).add_(0.05 * q95_b)
+
+        r_sp = self.ema_r_split.to(device=s_full.device, dtype=s_full.dtype)
+        s_rs = self.ema_sig_res.to(device=s_full.device, dtype=s_full.dtype)
+        raw_gamma = (r_sp.pow(4) / (r_sp.pow(4) + (self.split_r_gate_tau ** 4))) * (
+            s_rs.pow(4) / (s_rs.pow(4) + (self.sig_res_gate_tau ** 4))
+        )
+        gamma_gate = torch.clamp((raw_gamma - 0.02) / 0.98, min=0.0, max=1.0)
+
+        q05 = self.ema_q05.to(device=s_full.device, dtype=s_full.dtype).unsqueeze(0)
+        q95 = self.ema_q95.to(device=s_full.device, dtype=s_full.dtype).unsqueeze(0)
+        raw_span = torch.clamp(q95 - q05, min=0.05)
+        d_max = torch.clamp(raw_span.max(), min=0.75)
+        span = torch.clamp(raw_span, min=0.85 * d_max)
+        a = (s_full - q05) / span
+
+        k_half = max(self.n_pathways // 2, 1)
+        a_s = a[:, :k_half].mean(dim=-1, keepdim=True)
+        a_m = a[:, k_half:].mean(dim=-1, keepdim=True)
+        u_x = (a_s + a_m - 0.86) / 0.75
+        u_y = (a_m - a_s + 0.02) / 0.28
+        p2 = torch.cat([u_x, u_y], dim=-1)
+        r0_eff_sq = (0.40 ** 2) + 2.5 * ((1.0 - gamma_gate).pow(2))
+        u_ribbon_2d = (gamma_gate * 1.20) * p2 / torch.sqrt(p2.pow(2).sum(dim=-1, keepdim=True) + r0_eff_sq)
+        emp_go_6d = gamma_gate * (a - 0.43)
+        return emp_go_6d, u_ribbon_2d, gamma_gate
+
+    def compute_empirical_go_scores(self, x_full_log: torch.Tensor) -> torch.Tensor:
+        emp_go_6d, _, _ = self.compute_empirical_go_targets(x_full_log)
+        return emp_go_6d
 
     def forward(
         self,
@@ -594,27 +842,39 @@ class SplitNaturalShiftFiLM(nn.Module):
 
         g_act, g_perp = self.get_snr_gates(channel)
         V_hat, U_hat = self.get_effective_bases(channel, g_act, g_perp)
+        alpha_eff = (g_act[:2].mean() * alpha) if (channel == "cycle" and g_act.numel() >= 2) else alpha
 
         if channel == "cycle" and self.cycle_norm_mode == "natural_identity" and self.deleak_radial_cycle:
             if u_src.shape[-1] == 3:
                 plane_scale = torch.tensor([[1.0, 1.0, 0.05]], device=u_src.device, dtype=u_src.dtype)
                 delta_tan_ring = (g_act.unsqueeze(0) * gamma_par) * u_src
                 delta_perp_ring = F.linear(gamma_perp * F.linear(u_src, V_hat), U_hat)
-                delta_z = c_film * (delta_tan_ring + delta_perp_ring + alpha) * plane_scale
-                r_cur = torch.sqrt(u_src[:, 0:1].pow(2) + u_src[:, 1:2].pow(2) + 1e-6)
-                e_rad = torch.cat([u_src[:, 0:2] / r_cur, torch.zeros_like(r_cur)], dim=-1)
+                delta_z = c_film * (delta_tan_ring + delta_perp_ring + alpha_eff) * plane_scale
+                r2_cur = u_src[:, 0:1].pow(2) + u_src[:, 1:2].pow(2)
+                r0_rad_sq = 0.25 ** 2
+                r_cur = torch.sqrt(r2_cur + 1e-8)
+                e_rad_smooth = torch.cat(
+                    [u_src[:, 0:2] * (r_cur / (r2_cur + r0_rad_sq)), torch.zeros_like(r_cur)],
+                    dim=-1,
+                )
                 dr_leak = (self.pert_r_mean_cycle[sample_idx] - self.ctrl_r_mean_cycle).unsqueeze(-1)
-                u_base_clean = u_src - c_film * (dr_leak * e_rad).detach()
-                return u_base_clean + delta_z
+                u_base_clean = u_src - c_film * (dr_leak * e_rad_smooth).detach()
+                u_xy = u_base_clean[:, 0:2]
+                r_u = torch.sqrt(u_xy.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
+                z_raw_xy = u_xy + delta_z[:, 0:2]
+                z_retr_xy = r_u * (z_raw_xy / torch.sqrt(z_raw_xy.pow(2).sum(dim=-1, keepdim=True) + 1e-6))
+                z_xy = torch.where(c_film > 0.5, z_retr_xy, u_src[:, 0:2])
+                z_z2 = u_src[:, 2:3]
+                return torch.cat([z_xy, z_z2], dim=-1)
             else:
                 delta_tan_ring = (g_act.unsqueeze(0) * gamma_par) * u_src
                 delta_perp_ring = F.linear(gamma_perp * F.linear(u_src, V_hat), U_hat)
-                delta_z = c_film * (delta_tan_ring + delta_perp_ring + alpha)
+                delta_z = c_film * (delta_tan_ring + delta_perp_ring + alpha_eff)
                 return u_src + delta_z
 
         delta_tan = (g_act.unsqueeze(0) * gamma_par) * u_check
         delta_perp = F.linear(gamma_perp * F.linear(u_check, V_hat), U_hat)
-        delta_z = c_film * (delta_tan + delta_perp + alpha)
+        delta_z = c_film * (delta_tan + delta_perp + alpha_eff)
         return u_src + delta_z
 
     def _modulate_eval_helper(
@@ -844,8 +1104,11 @@ class BifurcatedDecoder(nn.Module):
         cycle_decoder_mode: str = "linear",
         split_ood_decoder: bool = False,
         gauge_fix_state: bool = False,
-        harmonic_2theta_scale: float = 0.25,
-        cycle_max_col_norm: Optional[float] = 3.6,
+        harmonic_2theta_scale: float = 0.75,
+        r0_smooth: float = 0.45,
+        radial_amp_scale: float = 1.0,
+        harmonic_basis_mode: str = "soft_unit_ribbon",
+        cycle_max_col_norm: Optional[float] = 10.0,
         n_cat_list: list = None,
         n_hidden: int = 128,
         n_hidden_ood: int = 64,
@@ -863,6 +1126,9 @@ class BifurcatedDecoder(nn.Module):
             self.cycle_decoder_mode in ("cylindrical_harmonic", "go_cylindrical")
         )
         self.harmonic_2theta_scale = float(harmonic_2theta_scale)
+        self.r0_smooth = float(r0_smooth)
+        self.radial_amp_scale = float(radial_amp_scale)
+        self.harmonic_basis_mode = str(harmonic_basis_mode)
 
         if n_latent_state is not None and n_latent_ood is not None:
             self.n_latent_state = int(n_latent_state)
@@ -899,13 +1165,15 @@ class BifurcatedDecoder(nn.Module):
 
         cyl_in_dim = 6 if self.n_latent_cycle == 3 else self.n_latent_cycle
         if self.cycle_decoder_mode == "go_cylindrical" and self.has_pathway_mask:
-            self.cyl_to_go = nn.Linear(cyl_in_dim, self.n_pathways)
+            use_go_bias = self.harmonic_basis_mode == "legacy_cylindrical"
+            self.cyl_to_go = nn.Linear(cyl_in_dim, self.n_pathways, bias=use_go_bias)
             with torch.no_grad():
-                if cyl_in_dim == self.n_pathways:
+                if self.harmonic_basis_mode == "legacy_cylindrical" and cyl_in_dim == self.n_pathways:
                     nn.init.eye_(self.cyl_to_go.weight)
                 else:
-                    nn.init.orthogonal_(self.cyl_to_go.weight)
-                nn.init.zeros_(self.cyl_to_go.bias)
+                    nn.init.normal_(self.cyl_to_go.weight, mean=0.0, std=0.1)
+                if self.cyl_to_go.bias is not None:
+                    nn.init.zeros_(self.cyl_to_go.bias)
 
             # Non-negative pathway-to-gene weights: Softplus(W_go_raw) * M_path^T
             self.go_gene_weight_raw = nn.Parameter(
@@ -983,6 +1251,9 @@ class BifurcatedDecoder(nn.Module):
         phi = expand_cylindrical_harmonics(
             cycle_latent,
             harmonic_2theta_scale=self.harmonic_2theta_scale,
+            r0_smooth=self.r0_smooth,
+            radial_amp_scale=self.radial_amp_scale,
+            harmonic_basis_mode=self.harmonic_basis_mode,
         )
         if self.cycle_decoder_mode == "go_cylindrical" and self.has_pathway_mask:
             return self.cyl_to_go(phi)
@@ -995,6 +1266,9 @@ class BifurcatedDecoder(nn.Module):
             phi_cyl = expand_cylindrical_harmonics(
                 z_cycle,
                 harmonic_2theta_scale=self.harmonic_2theta_scale,
+                r0_smooth=self.r0_smooth,
+                radial_amp_scale=self.radial_amp_scale,
+                harmonic_basis_mode=self.harmonic_basis_mode,
             )
             z_cycle_go = self.cyl_to_go(phi_cyl)
             M_path_t = self.pathway_mask.t().to(device=z_cycle.device, dtype=z_cycle.dtype)  # (G, K)
@@ -1010,6 +1284,9 @@ class BifurcatedDecoder(nn.Module):
             phi_cyl = expand_cylindrical_harmonics(
                 z_cycle,
                 harmonic_2theta_scale=self.harmonic_2theta_scale,
+                r0_smooth=self.r0_smooth,
+                radial_amp_scale=self.radial_amp_scale,
+                harmonic_basis_mode=self.harmonic_basis_mode,
             )
             masked_cycle_weight = self.cycle_head.weight * cyc_mask_1d.unsqueeze(1)
             masked_cycle_bias = self.cycle_head.bias * cyc_mask_1d
@@ -1297,7 +1574,13 @@ class PertVI_Inference(nn.Module):
             G_total = float(x.shape[-1])
             G_cyc = float(cyc_mask.sum().clamp(min=1.0).item())
             scale_cyc = math.sqrt(G_total / G_cyc)
-            x_cycle = (x * cyc_mask) * scale_cyc
+            if isinstance(self.encoder_cycle, PathwayCycleEncoder):
+                counts_est = torch.clamp(torch.expm1(x), min=0.0)
+                tot_counts = counts_est.sum(dim=-1, keepdim=True).clamp(min=1.0).detach()
+                x_cp10k = torch.log1p(counts_est * (1e4 / tot_counts))
+                x_cycle = (x_cp10k * cyc_mask) * scale_cyc
+            else:
+                x_cycle = (x * cyc_mask) * scale_cyc
             x_non_cycle = x * (1.0 - st_excl)
             x_state = self.basal_gene_dropout(x_non_cycle)
             x_ood = self.ood_sub_dropout(x_state * (1.0 - ood_quar))
@@ -1311,11 +1594,15 @@ class PertVI_Inference(nn.Module):
             q_m_cycle, q_v_cycle, u_cycle, u_cycle_go_enc = self.encoder_cycle(
                 x_cycle, return_go_scores=True
             )
-            emp_go_scores = self.encoder_cycle.compute_empirical_go_scores(x * cyc_mask if (self.cycle_gene_mask is not None and self.selective_cycle_input) else x)
+            emp_go_scores, emp_ribbon_2d, cycle_reliability_gate = (
+                self.encoder_cycle.compute_empirical_go_targets(x)
+            )
         else:
             q_m_cycle, q_v_cycle, u_cycle = self.encoder_cycle(x_cycle)
             u_cycle_go_enc = None
             emp_go_scores = None
+            emp_ribbon_2d = None
+            cycle_reliability_gate = None
 
         q_m_state, q_v_state, u_state = self.encoder_state(x_state)
         q_m_ood, q_v_ood, v_ood = self.encoder_ood(x_ood)
@@ -1390,4 +1677,8 @@ class PertVI_Inference(nn.Module):
             out["u_cycle_go_enc"] = u_cycle_go_enc
         if emp_go_scores is not None:
             out["emp_go_scores"] = emp_go_scores
+        if emp_ribbon_2d is not None:
+            out["emp_ribbon_2d"] = emp_ribbon_2d
+        if cycle_reliability_gate is not None:
+            out["cycle_reliability_gate"] = cycle_reliability_gate
         return out
