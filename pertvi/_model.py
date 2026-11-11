@@ -156,6 +156,9 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         elif getattr(self.__class__, "_loading_legacy_cyl_ckpt", False):
             if harmonic_basis_mode is None:
                 harmonic_basis_mode = "legacy_cylindrical"
+            model_kwargs = dict(model_kwargs)
+            model_kwargs.setdefault("ood_max_col_norm", None)
+            model_kwargs.setdefault("decouple_batch_state", False)
 
         if cycle_gene_mask_key not in adata.var.columns:
             raise ValueError(f"Column '{cycle_gene_mask_key}' not found in adata.var.")
@@ -241,15 +244,15 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         if ood_anchor_mode is None:
             ood_anchor_mode = "l2" if use_go_arch else "l1"
         if max_lambda_adv_state is None:
-            max_lambda_adv_state = 120.0 if use_go_arch else 100.0
+            max_lambda_adv_state = 160.0 if use_go_arch else 100.0
         if max_lambda_adv_ood is None:
             max_lambda_adv_ood = 120.0 if use_go_arch else 5.0
         if lambda_soft is None:
             lambda_soft = 150.0 if use_go_arch else 50.0
         if floor_lambda_ood is None:
-            floor_lambda_ood = 10.0 if use_go_arch else 5.0
+            floor_lambda_ood = 12.0 if use_go_arch else 5.0
         if max_lambda_ood is None:
-            max_lambda_ood = 100.0 if use_go_arch else 50.0
+            max_lambda_ood = 140.0 if use_go_arch else 50.0
         if beta_cyc is None:
             beta_cyc = 0.30 if use_go_arch else 0.50
         if sigma_cycle_z is None:

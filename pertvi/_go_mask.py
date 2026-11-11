@@ -468,7 +468,9 @@ def build_go_cycle_and_quarantine_masks(
         X_sub = adata.X[cell_sel]
 
     X_dense = X_sub.toarray().astype(np.float32) if sp.issparse(X_sub) else np.asarray(X_sub, dtype=np.float32)
-    X_log = np.log1p(np.maximum(X_dense, 0.0))
+    X_nonneg = np.maximum(X_dense, 0.0)
+    tot_counts = np.maximum(X_nonneg.sum(axis=1, keepdims=True), 1.0)
+    X_log = np.log1p(X_nonneg * (1e4 / tot_counts))
 
     # Obtain S_score and G2M_score on control cells
     if "S_score" in adata.obs.columns and "G2M_score" in adata.obs.columns:

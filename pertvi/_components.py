@@ -1109,6 +1109,8 @@ class BifurcatedDecoder(nn.Module):
         radial_amp_scale: float = 1.0,
         harmonic_basis_mode: str = "soft_unit_ribbon",
         cycle_max_col_norm: Optional[float] = 10.0,
+        ood_max_col_norm: Optional[float] = 1.85,
+        decouple_batch_state: bool = True,
         n_cat_list: list = None,
         n_hidden: int = 128,
         n_hidden_ood: int = 64,
@@ -1120,6 +1122,8 @@ class BifurcatedDecoder(nn.Module):
         self.n_latent_main = int(n_input - n_latent_cycle)
         self.n_genes = int(n_output)
         self.max_col_norm = max_col_norm
+        self.ood_max_col_norm = ood_max_col_norm
+        self.decouple_batch_state = bool(decouple_batch_state)
         self.cycle_decoder_mode = str(cycle_decoder_mode)
         self.split_ood_decoder = bool(split_ood_decoder)
         self.gauge_fix_state = bool(gauge_fix_state) or (
@@ -1207,7 +1211,11 @@ class BifurcatedDecoder(nn.Module):
         state_core_dim = self.n_latent_state if self.split_ood_decoder else self.n_latent_main
         if self.use_batch:
             self.batch_embed = nn.Embedding(n_cat_list[0], 16)
-            main_in_dim = state_core_dim + 16
+            main_in_dim = (
+                state_core_dim
+                if (self.split_ood_decoder and self.decouple_batch_state)
+                else (state_core_dim + 16)
+            )
             self.batch_gene_bias = nn.Linear(16, self.n_genes)
         else:
             main_in_dim = state_core_dim
@@ -1232,19 +1240,31 @@ class BifurcatedDecoder(nn.Module):
 
         # --- Pathway C: Dedicated Quarantined OOD Head (when split_ood_decoder=True) ---
         if self.split_ood_decoder and self.n_latent_ood > 0:
+            eff_ood_hid_col_norm = (
+                float(max_col_norm)
+                if (max_col_norm is not None and float(max_col_norm) > 0.0)
+                else (float(self.ood_max_col_norm) if (self.ood_max_col_norm is not None and float(self.ood_max_col_norm) > 0.0) else None)
+            )
             self.ood_hidden = nn.Sequential(
                 nn.Linear(self.n_latent_ood, int(n_hidden_ood), bias=False),
                 nn.ReLU(),
             )
-            if max_col_norm is not None and float(max_col_norm) > 0.0:
+            if eff_ood_hid_col_norm is not None:
                 register_parametrization(
                     self.ood_hidden[0],
                     "weight",
-                    MaxColNorm(max_col_norm=float(max_col_norm)),
+                    MaxColNorm(max_col_norm=eff_ood_hid_col_norm),
                 )
             self.ood_head = nn.Linear(int(n_hidden_ood), self.n_genes, bias=False)
             with torch.no_grad():
                 self.ood_head.weight.mul_((1.0 - ood_quar_f).unsqueeze(1))
+            if self.ood_max_col_norm is not None and float(self.ood_max_col_norm) > 0.0:
+                eff_ood_head_col_norm = float(self.ood_max_col_norm) * max(1.0, (float(self.n_genes) / 1000.0) ** 0.5)
+                register_parametrization(
+                    self.ood_head,
+                    "weight",
+                    MaxColNorm(max_col_norm=eff_ood_head_col_norm),
+                )
 
     def compute_go_pathway_coordinates(self, cycle_latent: torch.Tensor) -> torch.Tensor:
         """Maps a 3D cycle latent (u_cycle_src or z_cycle) to K=6 explicit GO pathway coordinates."""
@@ -1313,7 +1333,7 @@ class BifurcatedDecoder(nn.Module):
             v_ood = z[:, self.n_latent_cycle + self.n_latent_state :]
             if self.use_batch and batch_index is not None:
                 b_embed = self.batch_embed(batch_index.squeeze(-1))
-                z_state_in = torch.cat([z_state, b_embed], dim=-1)
+                z_state_in = z_state if self.decouple_batch_state else torch.cat([z_state, b_embed], dim=-1)
                 h_batch = self.batch_gene_bias(b_embed)
             else:
                 z_state_in = z_state
@@ -1633,11 +1653,7 @@ class PertVI_Inference(nn.Module):
 
         # Composition with Information Dropout on OOD (deterministic q_m_ood in eval mode)
         v_ood_dropped = self.ood_dropout(v_ood)
-        v_ood_for_z = (
-            v_ood_dropped
-            if (self.training or self.ood_dropout_rate > 0.0)
-            else q_m_ood
-        )
+        v_ood_for_z = v_ood_dropped if self.training else q_m_ood
 
         # Final composition
         z_final = torch.cat([z_base, v_ood_for_z], dim=-1)

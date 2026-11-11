@@ -124,6 +124,31 @@ def _snr_whitened_harmonic_hsic_penalty(
     return harm_pen + hsic_pen
 
 
+def _snr_whitened_state_ood_hsic_penalty(
+    q_m_ood: torch.Tensor,
+    q_v_ood: torch.Tensor,
+    q_m_state_detached: torch.Tensor,
+    q_v_state_detached: torch.Tensor,
+) -> torch.Tensor:
+    """Scale-Invariant SNR-Whitened Correlation + Multiscale RBF-HSIC Orthogonality (u_state -> v_ood)."""
+    n = q_m_ood.shape[0]
+    if n < 4:
+        return _linear_cov_penalty(q_m_ood, q_m_state_detached)
+
+    xo = q_m_ood - q_m_ood.mean(dim=0, keepdim=True)
+    vo = xo.pow(2).mean(dim=0, keepdim=True) + q_v_ood.detach().mean(dim=0, keepdim=True) + 1e-5
+    xo_hat = xo / torch.sqrt(vo)
+
+    xs = q_m_state_detached - q_m_state_detached.mean(dim=0, keepdim=True)
+    vs = xs.pow(2).mean(dim=0, keepdim=True) + q_v_state_detached.detach().mean(dim=0, keepdim=True) + 1e-5
+    xs_hat = xs / torch.sqrt(vs)
+
+    corr_mat = torch.matmul(xo_hat.t(), xs_hat) / (n - 1.0 + 1e-8)
+    corr_pen = torch.sum(corr_mat ** 2) / 3.0
+    hsic_pen = 10.0 * _unbiased_hsic(xo_hat, xs_hat)
+    return corr_pen + hsic_pen
+
+
 class PertVIModule(BaseModuleClass):
     def __init__(
         self,
@@ -182,6 +207,11 @@ class PertVIModule(BaseModuleClass):
         ood_dropout_rate: float = 0.3,
         dropout_rate: float = 0.1,
         max_col_norm: Union[float, str, None] = "auto",
+        ood_max_col_norm: Optional[float] = 1.85,
+        decouple_batch_state: bool = True,
+        sigma_ood_ctrl: float = 1.0,
+        ood_elastic_l2: Optional[float] = None,
+        lambda_batch_state: Optional[float] = None,
         ortho_mode: str = "linear_cov",
         ood_anchor_mode: str = "l1",
         max_lambda_adv_state: float = 100.0,
@@ -248,9 +278,23 @@ class PertVIModule(BaseModuleClass):
         self.lambda_soft = float(lambda_soft)
         self.floor_lambda_ood = float(floor_lambda_ood)
         self.max_lambda_ood = float(max_lambda_ood)
+        self.sigma_ood_ctrl = float(sigma_ood_ctrl)
+        self.ood_elastic_l2 = (
+            (0.5 if self.split_ood_decoder else 0.0)
+            if ood_elastic_l2 is None
+            else float(ood_elastic_l2)
+        )
+        self.lambda_batch_state = (
+            (4.5 if self.split_ood_decoder else 0.0)
+            if lambda_batch_state is None
+            else float(lambda_batch_state)
+        )
 
         if basal_gene_dropout_rate == "auto":
-            resolved_basal_drop = 0.05 if self.selective_cycle_input else (0.15 if film_mode == "m7_block_tt" else 0.0)
+            if self.split_ood_decoder and self.selective_cycle_input:
+                resolved_basal_drop = 0.0
+            else:
+                resolved_basal_drop = 0.05 if self.selective_cycle_input else (0.15 if film_mode == "m7_block_tt" else 0.0)
         else:
             resolved_basal_drop = float(basal_gene_dropout_rate)
 
@@ -313,6 +357,8 @@ class PertVIModule(BaseModuleClass):
             split_ood_decoder=self.split_ood_decoder,
             harmonic_basis_mode=self.harmonic_basis_mode,
             r0_smooth=self.r0_smooth,
+            ood_max_col_norm=ood_max_col_norm,
+            decouple_batch_state=decouple_batch_state,
             n_cat_list=[n_batch] if n_batch > 0 else None,
             n_layers=1,
             n_hidden=128,
@@ -435,7 +481,8 @@ class PertVIModule(BaseModuleClass):
         prior = Normal(0, 1)
         kl_state = kl(Normal(q_m_state, torch.sqrt(q_v_state)), prior).sum(dim=-1)
 
-        kl_ood_control = kl(Normal(torch.zeros_like(q_m_ood), torch.sqrt(q_v_ood)), prior).sum(dim=-1)
+        prior_ood_ctrl = Normal(0.0, self.sigma_ood_ctrl) if self.split_ood_decoder else prior
+        kl_ood_control = kl(Normal(torch.zeros_like(q_m_ood), torch.sqrt(q_v_ood)), prior_ood_ctrl).sum(dim=-1)
         kl_ood_treated = kl(Normal(q_m_ood, torch.sqrt(q_v_ood)), prior).sum(dim=-1)
         kl_ood_final = (kl_ood_control * control_mask_1d) + (kl_ood_treated * treated_mask_1d)
 
@@ -558,8 +605,10 @@ class PertVIModule(BaseModuleClass):
 
         kl_local_unaggregated = kl_cycle_weighted + kl_state + kl_ood_final + kl_library
 
-        # --- Orthogonality / Independence constraints (always detach q_m_cycle) ---
+        # --- Orthogonality / Independence constraints (strict causal hierarchy: u_cycle -> u_state -> v_ood) ---
         q_m_cycle_detached = q_m_cycle.detach()
+        q_m_state_detached = q_m_state.detach()
+        q_v_state_detached = q_v_state.detach()
         disentangle_state_cycle = self._compute_disentangle_penalty(
             q_m_state, q_v_state, q_m_cycle_detached, sample_idx=sample_idx
         )
@@ -571,22 +620,21 @@ class PertVIModule(BaseModuleClass):
             disentangle_ood_cycle = self._compute_disentangle_penalty(
                 q_m_ood, q_v_ood, q_m_cycle_detached, sample_idx=sample_idx
             )
-            if n_treat_mb >= 2:
-                disentangle_ood_state = _linear_cov_penalty(q_m_ood[treated_mask], q_m_state[treated_mask])
-            else:
-                disentangle_ood_state = torch.tensor(0.0, device=x.device)
+            disentangle_ood_state = _snr_whitened_state_ood_hsic_penalty(
+                q_m_ood, q_v_ood, q_m_state_detached, q_v_state_detached
+            )
         else:
             ood_ortho_fn = _unbiased_hsic if self.ortho_mode == "hsic" else _linear_cov_penalty
             min_treat = 4 if self.ortho_mode == "hsic" else 2
             if n_treat_mb >= min_treat:
                 q_m_cycle_treated = q_m_cycle_detached[treated_mask]
-                q_m_state_treated = q_m_state[treated_mask]
+                q_m_state_treated = q_m_state_detached[treated_mask]
                 q_m_ood_treated = q_m_ood[treated_mask]
                 disentangle_ood_cycle = ood_ortho_fn(q_m_ood_treated, q_m_cycle_treated)
                 disentangle_ood_state = ood_ortho_fn(q_m_ood_treated, q_m_state_treated)
             elif n_treat_mb > 1:
                 q_m_cycle_treated = q_m_cycle_detached[treated_mask]
-                q_m_state_treated = q_m_state[treated_mask]
+                q_m_state_treated = q_m_state_detached[treated_mask]
                 q_m_ood_treated = q_m_ood[treated_mask]
                 disentangle_ood_cycle = _linear_cov_penalty(q_m_ood_treated, q_m_cycle_treated)
                 disentangle_ood_state = _linear_cov_penalty(q_m_ood_treated, q_m_state_treated)
@@ -594,12 +642,32 @@ class PertVIModule(BaseModuleClass):
                 disentangle_ood_cycle = torch.tensor(0.0, device=x.device)
                 disentangle_ood_state = torch.tensor(0.0, device=x.device)
 
-        # --- Control Anchor on v_ood (Smooth L2 or L1) ---
+        # --- Control Anchor on v_ood (Elastic L1+L2 or Smooth L2) ---
         if self.ood_anchor_mode == "l2":
             ood_ctrl_penalty_per_cell = 0.5 * torch.sum(q_m_ood ** 2, dim=-1)
         else:
-            ood_ctrl_penalty_per_cell = torch.sum(torch.abs(q_m_ood), dim=-1)
+            ood_ctrl_penalty_per_cell = torch.sum(
+                torch.abs(q_m_ood) + self.ood_elastic_l2 * (q_m_ood ** 2), dim=-1
+            )
         ood_control_pen = ood_ctrl_penalty_per_cell * control_mask_1d
+
+        # --- Cross-Batch Centroid Alignment on Basal u_state ---
+        l_batch_state = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        batch_idx = tensors.get("batch")
+        if self.lambda_batch_state > 0.0 and batch_idx is not None:
+            b_1d = batch_idx.view(-1).long()
+            b_uniq = torch.unique(b_1d)
+            if b_uniq.numel() >= 2:
+                mu_st_global = q_m_state.mean(dim=0)
+                n_tot_b = float(q_m_state.shape[0])
+                for b_val in b_uniq:
+                    mb = b_1d == b_val
+                    nb = int(mb.sum().item())
+                    if nb >= 4:
+                        l_batch_state = l_batch_state + (float(nb) / n_tot_b) * (
+                            (q_m_state[mb].mean(dim=0) - mu_st_global).pow(2).sum()
+                        )
+                l_batch_state = self.lambda_batch_state * l_batch_state
 
         # --- Soft L1 penalty mask on main head ---
         cycle_mask_float = self.generative_net.cycle_gene_mask.float().unsqueeze(1)
@@ -624,7 +692,11 @@ class PertVIModule(BaseModuleClass):
         lambda_kl = 1.0
         lambda_adv_state = getattr(self, "current_lambda_adv_state", self.max_lambda_adv_state)
         lambda_adv_ood = getattr(self, "current_lambda_adv_ood", self.max_lambda_adv_ood)
-        lambda_adv_state_ood = 5.0
+        lambda_adv_state_ood = (
+            0.5 * lambda_adv_ood
+            if (self.ood_all_cells_hsic and self.ortho_mode == "snr_harmonic_hsic")
+            else 5.0
+        )
         lambda_ood_anchor = getattr(self, "current_lambda_ood", self.max_lambda_ood)
         lambda_soft = self.lambda_soft
 
@@ -639,6 +711,7 @@ class PertVIModule(BaseModuleClass):
             + l_circ
             + l_drug_cycle
             + l_go_pathway
+            + l_batch_state
             + (lambda_adv_state * disentangle_state_cycle)
             + (lambda_adv_ood * disentangle_ood_cycle)
             + (lambda_adv_state_ood * disentangle_ood_state)
