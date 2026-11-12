@@ -76,6 +76,7 @@ def _snr_whitened_harmonic_hsic_penalty(
     q_m_state: torch.Tensor,
     q_v_state: torch.Tensor,
     q_m_cycle_detached: torch.Tensor,
+    zca_whiten: bool = False,
 ) -> torch.Tensor:
     """Scale-Invariant SNR-Whitened Spherical/Cylindrical Harmonic + RBF-HSIC Orthogonality Penalty."""
     n = q_m_state.shape[0]
@@ -85,7 +86,16 @@ def _snr_whitened_harmonic_hsic_penalty(
     xc = q_m_state - q_m_state.mean(dim=0, keepdim=True)
     var_qm = xc.pow(2).mean(dim=0, keepdim=True)
     mean_qv = q_v_state.detach().mean(dim=0, keepdim=True)
-    x_tilde = xc / torch.sqrt(var_qm + mean_qv + 1e-5)
+    if zca_whiten:
+        x_u = xc / torch.sqrt(var_qm + 1e-5)
+        with torch.no_grad():
+            cov_x = torch.matmul(x_u.t(), x_u) / (n - 1.0 + 1e-8)
+            evals_x, evecs_x = torch.linalg.eigh(cov_x)
+            inv_sqrt_x = evecs_x @ torch.diag((evals_x.clamp(min=0.0) + 0.02).rsqrt()) @ evecs_x.t()
+        x_tilde = torch.matmul(x_u, inv_sqrt_x)
+    else:
+        w_snr_x = torch.sqrt(var_qm.detach() / (var_qm.detach() + mean_qv + 1e-5))
+        x_tilde = w_snr_x * (xc / torch.sqrt(var_qm + 1e-5))
 
     y_raw = q_m_cycle_detached - q_m_cycle_detached.mean(dim=0, keepdim=True)
     if y_raw.shape[1] < 3:
@@ -96,7 +106,8 @@ def _snr_whitened_harmonic_hsic_penalty(
     rad = torch.sqrt(y_raw.pow(2).sum(dim=-1, keepdim=True) + 1e-6)
     y2 = torch.cat(
         [
-            y_raw.pow(2),
+            y1[:, 0:1].pow(2) - y1[:, 1:2].pow(2),
+            y1[:, 2:3].pow(2),
             y1[:, 0:1] * y1[:, 1:2],
             y1[:, 0:1] * y1[:, 2:3],
             y1[:, 1:2] * y1[:, 2:3],
@@ -115,9 +126,14 @@ def _snr_whitened_harmonic_hsic_penalty(
     phi = torch.cat([y_raw, rad, y2, y3], dim=-1)
     phi_c = phi - phi.mean(dim=0, keepdim=True)
     phi_hat = phi_c / torch.sqrt(phi_c.pow(2).mean(dim=0, keepdim=True) + 1e-6)
+    rad_col = y_raw.shape[1]
+    phi_weights = torch.ones((1, phi_hat.shape[1]), device=phi_hat.device, dtype=phi_hat.dtype)
+    phi_weights[0, rad_col] = 0.25
+    phi_hat = phi_hat * phi_weights
 
+    null_floor = 1.0 / float(max(n - 1, 1))
     corr_mat = torch.matmul(x_tilde.t(), phi_hat) / (n - 1.0 + 1e-8)
-    harm_pen = torch.sum(corr_mat ** 2) / 3.0
+    harm_pen = F.relu(corr_mat.pow(2) - null_floor).sum() / 3.0
 
     y_hat = y_raw / torch.sqrt(y_raw.pow(2).mean(dim=0, keepdim=True) + 1e-6)
     hsic_pen = 10.0 * _unbiased_hsic(x_tilde, y_hat)
@@ -129,24 +145,68 @@ def _snr_whitened_state_ood_hsic_penalty(
     q_v_ood: torch.Tensor,
     q_m_state_detached: torch.Tensor,
     q_v_state_detached: torch.Tensor,
+    g_act_state: Optional[torch.Tensor] = None,
+    u_state_src_detached: Optional[torch.Tensor] = None,
+    z_state_detached: Optional[torch.Tensor] = None,
+    z_cycle_detached: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Scale-Invariant SNR-Whitened Correlation + Multiscale RBF-HSIC Orthogonality (u_state -> v_ood)."""
+    """Degree-0 ZCA-Whitened Multivariate Correlation + Off-Diagonal De-Collinearization + RBF-HSIC (state/cycle -> v_ood)."""
     n = q_m_ood.shape[0]
     if n < 4:
         return _linear_cov_penalty(q_m_ood, q_m_state_detached)
 
     xo = q_m_ood - q_m_ood.mean(dim=0, keepdim=True)
-    vo = xo.pow(2).mean(dim=0, keepdim=True) + q_v_ood.detach().mean(dim=0, keepdim=True) + 1e-5
-    xo_hat = xo / torch.sqrt(vo)
+    var_o = xo.pow(2).mean(dim=0, keepdim=True)
+    xo_unit = xo / torch.sqrt(var_o + 1e-5)
+
+    with torch.no_grad():
+        cov_o = torch.matmul(xo_unit.t(), xo_unit) / (n - 1.0 + 1e-8)
+        evals_o, evecs_o = torch.linalg.eigh(cov_o)
+        inv_sqrt_o = evecs_o @ torch.diag((evals_o.clamp(min=0.0) + 0.02).rsqrt()) @ evecs_o.t()
+    xo_zca = torch.matmul(xo_unit, inv_sqrt_o)
+
+    corr_o_live = torch.matmul(xo_unit.t(), xo_unit) / (n - 1.0 + 1e-8)
+    off_diag_o = corr_o_live - torch.diag(torch.diagonal(corr_o_live))
+    decoll_pen = 0.08 * off_diag_o.pow(2).sum()
 
     xs = q_m_state_detached - q_m_state_detached.mean(dim=0, keepdim=True)
-    vs = xs.pow(2).mean(dim=0, keepdim=True) + q_v_state_detached.detach().mean(dim=0, keepdim=True) + 1e-5
+    vs = xs.pow(2).mean(dim=0, keepdim=True) + 1e-5
     xs_hat = xs / torch.sqrt(vs)
+    if g_act_state is not None and g_act_state.numel() == xs_hat.shape[1]:
+        g_mask = g_act_state.detach().to(device=xs_hat.device, dtype=xs_hat.dtype).unsqueeze(0)
+        xs_hat = xs_hat * g_mask
+        d_scale_sqrt = (float(xs_hat.shape[1]) / max(float(g_mask.sum().item()), 1.0)) ** 0.5
+    else:
+        g_mask = None
+        d_scale_sqrt = 1.0
 
-    corr_mat = torch.matmul(xo_hat.t(), xs_hat) / (n - 1.0 + 1e-8)
-    corr_pen = torch.sum(corr_mat ** 2) / 3.0
-    hsic_pen = 10.0 * _unbiased_hsic(xo_hat, xs_hat)
-    return corr_pen + hsic_pen
+    corr_mat = torch.matmul(xo_zca.t(), xs_hat) / (n - 1.0 + 1e-8)
+    corr_pen = d_scale_sqrt * corr_mat.pow(2).sum()
+
+    if u_state_src_detached is not None and u_state_src_detached.shape == q_m_state_detached.shape:
+        us = u_state_src_detached - u_state_src_detached.mean(dim=0, keepdim=True)
+        us_hat = us / torch.sqrt(us.pow(2).mean(dim=0, keepdim=True) + 1e-5)
+        if g_mask is not None:
+            us_hat = us_hat * g_mask
+        corr_mat_src = torch.matmul(xo_zca.t(), us_hat) / (n - 1.0 + 1e-8)
+        corr_pen = corr_pen + (0.65 * d_scale_sqrt) * corr_mat_src.pow(2).sum()
+
+    if z_state_detached is not None and z_state_detached.shape == q_m_state_detached.shape:
+        zs = z_state_detached - z_state_detached.mean(dim=0, keepdim=True)
+        zs_hat = zs / torch.sqrt(zs.pow(2).mean(dim=0, keepdim=True) + 1e-5)
+        if g_mask is not None:
+            zs_hat = zs_hat * g_mask
+        corr_mat_zst = torch.matmul(xo_zca.t(), zs_hat) / (n - 1.0 + 1e-8)
+        corr_pen = corr_pen + (0.55 * d_scale_sqrt) * corr_mat_zst.pow(2).sum()
+
+    if z_cycle_detached is not None and z_cycle_detached.shape[0] == n:
+        zc = z_cycle_detached - z_cycle_detached.mean(dim=0, keepdim=True)
+        zc_hat = zc / torch.sqrt(zc.pow(2).mean(dim=0, keepdim=True) + 1e-5)
+        corr_mat_zcyc = torch.matmul(xo_zca.t(), zc_hat) / (n - 1.0 + 1e-8)
+        corr_pen = corr_pen + 0.55 * corr_mat_zcyc.pow(2).sum()
+
+    hsic_pen = 10.0 * _unbiased_hsic(xo_zca, xs_hat)
+    return corr_pen + decoll_pen + hsic_pen
 
 
 class PertVIModule(BaseModuleClass):
@@ -207,11 +267,22 @@ class PertVIModule(BaseModuleClass):
         ood_dropout_rate: float = 0.3,
         dropout_rate: float = 0.1,
         max_col_norm: Union[float, str, None] = "auto",
+        state_orth_max_col_norm: Optional[float] = None,
+        state_orth_max_shift_norm: Optional[float] = None,
+        main_head_max_col_norm: Optional[float] = None,
+        ood_hidden_max_col_norm: Optional[float] = None,
         ood_max_col_norm: Optional[float] = 1.85,
         decouple_batch_state: bool = True,
         sigma_ood_ctrl: float = 1.0,
         ood_elastic_l2: Optional[float] = None,
+        ood_treated_l1: float = 0.0,
         lambda_batch_state: Optional[float] = None,
+        max_active_basal_dims: Optional[int] = None,
+        active_gate_ln: bool = False,
+        deleak_basal_state: bool = False,
+        beta_state_orth: float = 0.0,
+        lambda_pert_state: float = 0.0,
+        lambda_w_orth: float = 0.0,
         ortho_mode: str = "linear_cov",
         ood_anchor_mode: str = "l1",
         max_lambda_adv_state: float = 100.0,
@@ -289,6 +360,12 @@ class PertVIModule(BaseModuleClass):
             if lambda_batch_state is None
             else float(lambda_batch_state)
         )
+        self.active_gate_ln = bool(active_gate_ln)
+        self.deleak_basal_state = bool(deleak_basal_state)
+        self.beta_state_orth = float(beta_state_orth)
+        self.lambda_pert_state = float(lambda_pert_state)
+        self.lambda_w_orth = float(lambda_w_orth)
+        self.ood_treated_l1 = float(ood_treated_l1)
 
         if basal_gene_dropout_rate == "auto":
             if self.split_ood_decoder and self.selective_cycle_input:
@@ -341,6 +418,10 @@ class PertVIModule(BaseModuleClass):
             n_obs_total=n_obs_total,
             sample_counts=sample_counts,
             is_control_sample=is_control_sample,
+            max_active_basal_dims=max_active_basal_dims,
+            active_gate_ln=self.active_gate_ln,
+            deleak_basal_state=self.deleak_basal_state,
+            state_orth_max_shift_norm=state_orth_max_shift_norm,
         )
 
         self.generative_net = BifurcatedDecoder(
@@ -359,10 +440,14 @@ class PertVIModule(BaseModuleClass):
             r0_smooth=self.r0_smooth,
             ood_max_col_norm=ood_max_col_norm,
             decouple_batch_state=decouple_batch_state,
-            n_cat_list=[n_batch] if n_batch > 0 else None,
+            n_cat_list=[n_batch] if (n_batch > 1 or (n_batch > 0 and not self.active_gate_ln)) else None,
             n_layers=1,
             n_hidden=128,
             max_col_norm=resolved_max_col_norm,
+            state_orth_max_col_norm=state_orth_max_col_norm,
+            main_head_max_col_norm=main_head_max_col_norm,
+            ood_hidden_max_col_norm=ood_hidden_max_col_norm,
+            use_expressive_cycle_shift=self.active_gate_ln,
         )
 
         self.px_r = torch.nn.Parameter(torch.randn(n_input))
@@ -387,13 +472,18 @@ class PertVIModule(BaseModuleClass):
         q_v: torch.Tensor,
         q_m_cycle_detached: torch.Tensor,
         sample_idx: Optional[torch.Tensor] = None,
+        zca_whiten: bool = False,
     ) -> torch.Tensor:
         if self.ortho_mode == "snr_harmonic_hsic":
-            marg_pen = _snr_whitened_harmonic_hsic_penalty(q_m, q_v, q_m_cycle_detached)
+            marg_pen = _snr_whitened_harmonic_hsic_penalty(
+                q_m, q_v, q_m_cycle_detached, zca_whiten=zca_whiten
+            )
             if self.within_pert_hsic_weight > 0.0 and sample_idx is not None:
                 dq_m = _within_perturbation_eb_center(q_m, sample_idx)
                 dq_cyc = _within_perturbation_eb_center(q_m_cycle_detached, sample_idx).detach()
-                cond_pen = _snr_whitened_harmonic_hsic_penalty(dq_m, q_v, dq_cyc)
+                cond_pen = _snr_whitened_harmonic_hsic_penalty(
+                    dq_m, q_v, dq_cyc, zca_whiten=zca_whiten
+                )
                 w = float(self.within_pert_hsic_weight)
                 return (1.0 - w) * marg_pen + w * cond_pen
             return marg_pen
@@ -426,17 +516,32 @@ class PertVIModule(BaseModuleClass):
         is_treated = tensors.get("is_treated")
 
         outputs = self.inference_net(x_log, sample_index, is_treated=is_treated)
+        if getattr(self.inference_net.split_film_transition, "film_mode", "") == "m7_block_tt":
+            film_inf = self.inference_net.split_film_transition
+            self.generative_net.update_state_col_bounds(
+                film_inf.get_snr_gates("state")[0],
+                w_gate=film_inf._get_state_gate_warmup(),
+            )
         if self.cycle_decoder_mode in ("go_cylindrical", "cylindrical_harmonic"):
             outputs["u_cycle_go"] = self.generative_net.compute_go_pathway_coordinates(
-                outputs["u_cycle_src"].detach()
+                outputs["u_cycle_src"].detach(), expressive=False
             )
-            outputs["z_cycle_go"] = self.generative_net.compute_go_pathway_coordinates(outputs["z_cycle"])
+            outputs["z_cycle_go"] = self.generative_net.compute_go_pathway_coordinates(
+                outputs["z_cycle"], expressive=self.active_gate_ln
+            )
         return outputs
 
     @auto_move_data
     def generative(self, tensors, inference_outputs):
         z = inference_outputs["z_final"]
         batch_index = tensors.get("batch")
+
+        if getattr(self.inference_net.split_film_transition, "film_mode", "") == "m7_block_tt":
+            film_inf = self.inference_net.split_film_transition
+            self.generative_net.update_state_col_bounds(
+                film_inf.get_snr_gates("state")[0],
+                w_gate=film_inf._get_state_gate_warmup(),
+            )
 
         library_log = inference_outputs["library_log"].view(-1, 1)
 
@@ -479,12 +584,47 @@ class PertVIModule(BaseModuleClass):
         reconst_loss = -NegativeBinomial(mu=px_rate, theta=px_r).log_prob(x_safe).sum(dim=-1)
 
         prior = Normal(0, 1)
-        kl_state = kl(Normal(q_m_state, torch.sqrt(q_v_state)), prior).sum(dim=-1)
+        if (
+            self.beta_state_orth > 0.0
+            and getattr(self.inference_net.split_film_transition, "film_mode", "") == "m7_block_tt"
+        ):
+            film_st_kl = self.inference_net.split_film_transition
+            w_gate_kl = film_st_kl._get_state_gate_warmup()
+            _, g_perp_st = film_st_kl.get_snr_gates("state")
+            w_kl_st = 1.0 + (self.beta_state_orth * w_gate_kl) * (g_perp_st.detach().pow(2)).unsqueeze(0)
+            kl_state = (kl(Normal(q_m_state, torch.sqrt(q_v_state)), prior) * w_kl_st).sum(dim=-1)
+        else:
+            kl_state = kl(Normal(q_m_state, torch.sqrt(q_v_state)), prior).sum(dim=-1)
 
         prior_ood_ctrl = Normal(0.0, self.sigma_ood_ctrl) if self.split_ood_decoder else prior
         kl_ood_control = kl(Normal(torch.zeros_like(q_m_ood), torch.sqrt(q_v_ood)), prior_ood_ctrl).sum(dim=-1)
         kl_ood_treated = kl(Normal(q_m_ood, torch.sqrt(q_v_ood)), prior).sum(dim=-1)
-        kl_ood_final = (kl_ood_control * control_mask_1d) + (kl_ood_treated * treated_mask_1d)
+        if self.active_gate_ln and self.split_ood_decoder:
+            ood_tr_l1 = self.ood_treated_l1 * torch.sum(torch.abs(q_m_ood), dim=-1)
+            ood_within_pen = torch.zeros_like(kl_ood_treated)
+            film_ood_kl = self.inference_net.split_film_transition
+            w_gate_kl_ood = (
+                film_ood_kl._get_state_gate_warmup()
+                if getattr(film_ood_kl, "film_mode", "") == "m7_block_tt"
+                else 1.0
+            )
+            sc_buf = getattr(film_ood_kl, "sample_counts", None)
+            if w_gate_kl_ood > 0.0 and sample_idx is not None and sc_buf is not None and sc_buf.numel() > 0:
+                tr_bool = treated_mask_1d > 0.5
+                if int(tr_bool.sum().item()) >= 2:
+                    mu_ood_sh = torch.zeros_like(q_m_ood)
+                    for s_val in torch.unique(sample_idx[tr_bool]):
+                        m_s = tr_bool & (sample_idx == s_val)
+                        if int(m_s.sum().item()) >= 2:
+                            n_tot_s = float(sc_buf[s_val].item())
+                            w_eb_ood = n_tot_s / (n_tot_s + 40.0)
+                            mu_ood_sh[m_s] = w_eb_ood * q_m_ood[m_s].mean(dim=0, keepdim=True).detach()
+                    ood_within_pen = (0.015 * w_gate_kl_ood) * torch.sum((q_m_ood - mu_ood_sh).pow(2), dim=-1)
+            kl_ood_final = (kl_ood_control * control_mask_1d) + (
+                (kl_ood_treated + ood_within_pen + ood_tr_l1) * treated_mask_1d
+            )
+        else:
+            kl_ood_final = (kl_ood_control * control_mask_1d) + (kl_ood_treated * treated_mask_1d)
 
         empirical_counts = torch.clamp(x_safe.sum(dim=-1, keepdim=True), min=1.0)
         empirical_library_log = torch.log(empirical_counts).detach()
@@ -536,24 +676,86 @@ class PertVIModule(BaseModuleClass):
             kl_cycle = kl(Normal(q_m_cycle, torch.sqrt(q_v_cycle)), prior).sum(dim=-1)
             kl_cycle_weighted = self.beta_cyc * kl_cycle
 
-        if self.lambda_drug_cycle_align > 0.0 and sample_idx is not None:
-            r12_all = (
-                torch.sqrt(q_m_cycle[:, 0].pow(2) + q_m_cycle[:, 1].pow(2) + 1e-6)
-                if q_m_cycle.shape[1] >= 2
-                else torch.sqrt(q_m_cycle.pow(2).sum(dim=-1) + 1e-6)
-            )
-            r_global = r12_all.mean().detach()
-            n_groups = 0
-            for s_val in torch.unique(sample_idx):
-                m_s = sample_idx == s_val
-                if int(m_s.sum().item()) >= 8:
-                    r_mean_s = r12_all[m_s].mean()
-                    l_drug_cycle = l_drug_cycle + ((r_mean_s - r_global).pow(2))
-                    n_groups += 1
-            if n_groups > 0:
-                l_drug_cycle = self.lambda_drug_cycle_align * (l_drug_cycle / float(n_groups))
+        gamma_rib = inference_outputs.get("cycle_reliability_gate")
+        g_rib = (
+            torch.clamp(gamma_rib.detach(), min=0.0, max=1.0)
+            if gamma_rib is not None
+            else torch.tensor(1.0, device=x.device, dtype=x.dtype)
+        )
+        w_polar = torch.clamp((g_rib - 0.15) / 0.35, min=0.0, max=1.0)
 
-        # --- GO Pathway & Forward Soft-Ribbon Coordinate Alignment Loss (v0.4.2) ---
+        if self.lambda_drug_cycle_align > 0.0 and sample_idx is not None:
+            if self.active_gate_ln and q_m_cycle.shape[1] >= 2:
+                mu_xy_all = q_m_cycle[:, :2]
+                r12_all = torch.sqrt(mu_xy_all.pow(2).sum(dim=-1) + 1e-6)
+                r2_den = mu_xy_all.pow(2).sum(dim=-1, keepdim=True) + 0.04
+                h2_all = torch.cat(
+                    [
+                        (mu_xy_all[:, 0:1].pow(2) - mu_xy_all[:, 1:2].pow(2)) / r2_den,
+                        (2.0 * mu_xy_all[:, 0:1] * mu_xy_all[:, 1:2]) / r2_den,
+                    ],
+                    dim=-1,
+                )
+                ctrl_m_bool = control_mask_1d > 0.5
+                if int(ctrl_m_bool.sum().item()) >= 4:
+                    r_ref = r12_all[ctrl_m_bool].mean().detach()
+                    u_xy_ref = mu_xy_all[ctrl_m_bool].mean(dim=0).detach()
+                    h2_ref = h2_all[ctrl_m_bool].mean(dim=0).detach()
+                else:
+                    r_ref = r12_all.mean().detach()
+                    u_xy_ref = mu_xy_all.mean(dim=0).detach()
+                    h2_ref = h2_all.mean(dim=0).detach()
+
+                l_mb_cyc = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+                n_groups = 0
+                for s_val in torch.unique(sample_idx):
+                    m_s = sample_idx == s_val
+                    n_s = int(m_s.sum().item())
+                    if n_s >= 6:
+                        r_mean_s = r12_all[m_s].mean()
+                        u_xy_s = mu_xy_all[m_s]
+                        u_mean_s = u_xy_s.mean(dim=0)
+                        var_deb_s = u_xy_s.var(dim=0, unbiased=True).sum().detach() / float(n_s)
+                        cent_pen_s = F.relu((u_mean_s - u_xy_ref).pow(2).sum() - var_deb_s)
+                        h2_s = h2_all[m_s]
+                        h2_mean_s = h2_s.mean(dim=0)
+                        h2_var_deb_s = h2_s.var(dim=0, unbiased=True).sum().detach() / float(n_s)
+                        h2_pen_s = F.relu((h2_mean_s - h2_ref).pow(2).sum() - h2_var_deb_s)
+                        l_mb_cyc = l_mb_cyc + ((r_mean_s - r_ref).pow(2)) + cent_pen_s + 0.5 * h2_pen_s
+                        n_groups += 1
+                if n_groups > 0:
+                    l_mb_cyc = l_mb_cyc / float(n_groups)
+
+                l_ema_cyc = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+                film_mod_c = self.inference_net.split_film_transition
+                if (
+                    getattr(film_mod_c, "film_mode", "") == "m7_block_tt"
+                    and film_mod_c.ctrl_stats_init.item() > 0.0
+                ):
+                    mu_hat_cyc = film_mod_c.get_shrunk_centroids("cycle")[sample_idx][:, :2]
+                    ctrl_mu_cyc = film_mod_c.ctrl_mean_cycle[:2].to(device=x.device, dtype=x.dtype).unsqueeze(0)
+                    dmu_cyc = (treated_mask_1d.unsqueeze(-1) * (mu_hat_cyc - ctrl_mu_cyc)).detach()
+                    l_ema_cyc = (mu_xy_all - (mu_xy_all - dmu_cyc).detach()).pow(2).sum(dim=-1).mean()
+
+                l_drug_cycle = self.lambda_drug_cycle_align * w_polar * (0.5 * l_ema_cyc + 0.5 * l_mb_cyc)
+            else:
+                r12_all = (
+                    torch.sqrt(q_m_cycle[:, 0].pow(2) + q_m_cycle[:, 1].pow(2) + 1e-6)
+                    if q_m_cycle.shape[1] >= 2
+                    else torch.sqrt(q_m_cycle.pow(2).sum(dim=-1) + 1e-6)
+                )
+                r_global = r12_all.mean().detach()
+                n_groups = 0
+                for s_val in torch.unique(sample_idx):
+                    m_s = sample_idx == s_val
+                    if int(m_s.sum().item()) >= 8:
+                        r_mean_s = r12_all[m_s].mean()
+                        l_drug_cycle = l_drug_cycle + ((r_mean_s - r_global).pow(2))
+                        n_groups += 1
+                if n_groups > 0:
+                    l_drug_cycle = self.lambda_drug_cycle_align * (l_drug_cycle / float(n_groups))
+
+        # --- GO Pathway & Forward Soft-Ribbon Coordinate Alignment Loss (v0.4.2 / v0.4.3) ---
         l_go_pathway = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         if (
             self.lambda_go_pathway > 0.0
@@ -561,12 +763,84 @@ class PertVIModule(BaseModuleClass):
             and inference_outputs["emp_go_scores"] is not None
         ):
             emp_go_target = inference_outputs["emp_go_scores"].detach()
-            if "u_cycle_go" in inference_outputs and inference_outputs["u_cycle_go"] is not None:
-                u_go = inference_outputs["u_cycle_go"]
-                l_go_pathway = l_go_pathway + F.mse_loss(u_go, emp_go_target)
-            if "u_cycle_go_enc" in inference_outputs and inference_outputs["u_cycle_go_enc"] is not None:
-                u_go_enc = inference_outputs["u_cycle_go_enc"]
-                l_go_pathway = l_go_pathway + 0.5 * F.mse_loss(u_go_enc, emp_go_target)
+            if self.active_gate_ln:
+                film_c_ref = self.inference_net.split_film_transition
+                emp_go_basal = emp_go_target
+                if (
+                    sample_idx is not None
+                    and getattr(film_c_ref, "film_mode", "") == "m7_block_tt"
+                ):
+                    s_n = int(film_c_ref.n_samples)
+                    k_go = int(emp_go_target.shape[1])
+                    if (
+                        not hasattr(self, "_ema_go_pert")
+                        or self._ema_go_pert.shape != (s_n, k_go)
+                        or self._ema_go_pert.device != x.device
+                    ):
+                        self._ema_go_pert = torch.zeros(s_n, k_go, device=x.device, dtype=torch.float32)
+                        self._ema_go_ctrl = torch.zeros(k_go, device=x.device, dtype=torch.float32)
+                        self._ema_go_init = torch.zeros(s_n, device=x.device, dtype=torch.float32)
+                        self._ema_go_ctrl_init = False
+                    if self.training:
+                        with torch.no_grad():
+                            cm_b = control_mask_1d > 0.5
+                            if int(cm_b.sum().item()) >= 2:
+                                c_mean = emp_go_target[cm_b].float().mean(dim=0)
+                                if not self._ema_go_ctrl_init:
+                                    self._ema_go_ctrl.copy_(c_mean)
+                                    self._ema_go_ctrl_init = True
+                                else:
+                                    self._ema_go_ctrl.mul_(0.95).add_(0.05 * c_mean)
+                            for sv in torch.unique(sample_idx).tolist():
+                                ms = sample_idx == sv
+                                if int(ms.sum().item()) >= 2:
+                                    p_mean = emp_go_target[ms].float().mean(dim=0)
+                                    if self._ema_go_init[sv].item() == 0.0:
+                                        self._ema_go_pert[sv].copy_(p_mean)
+                                        self._ema_go_init[sv] = 1.0
+                                    else:
+                                        self._ema_go_pert[sv].mul_(0.90).add_(0.10 * p_mean)
+                    if self._ema_go_ctrl_init:
+                        sc_cnt = film_c_ref.sample_counts.to(device=x.device, dtype=torch.float32)
+                        w_sh_go = ((sc_cnt / (sc_cnt + 16.0)) * self._ema_go_init).unsqueeze(-1)
+                        d_go_all = w_sh_go * (self._ema_go_pert - self._ema_go_ctrl.unsqueeze(0))
+                        emp_go_basal = (
+                            emp_go_target
+                            - treated_mask_1d.unsqueeze(-1) * d_go_all[sample_idx].to(dtype=emp_go_target.dtype)
+                        ).detach()
+
+                n_ctrl_go = control_mask_1d.sum()
+                has_ctrl_go = float(n_ctrl_go.item()) >= 1.0
+                if "z_cycle_go" in inference_outputs and inference_outputs["z_cycle_go"] is not None:
+                    z_go = inference_outputs["z_cycle_go"]
+                    l_go_pathway = l_go_pathway + 1.8 * F.mse_loss(z_go, emp_go_target)
+                if "u_cycle_go" in inference_outputs and inference_outputs["u_cycle_go"] is not None:
+                    u_go = inference_outputs["u_cycle_go"]
+                    u_go_err = (u_go - emp_go_basal).pow(2).mean(dim=-1)
+                    l_u_go = (
+                        (u_go_err * control_mask_1d).sum() / n_ctrl_go.clamp(min=1.0)
+                        + 0.08 * (u_go_err * treated_mask_1d).mean()
+                        if has_ctrl_go
+                        else u_go_err.mean()
+                    )
+                    l_go_pathway = l_go_pathway + 0.50 * l_u_go
+                if "u_cycle_go_enc" in inference_outputs and inference_outputs["u_cycle_go_enc"] is not None:
+                    u_go_enc = inference_outputs["u_cycle_go_enc"]
+                    u_enc_err = (u_go_enc - emp_go_basal).pow(2).mean(dim=-1)
+                    l_u_enc = (
+                        (u_enc_err * control_mask_1d).sum() / n_ctrl_go.clamp(min=1.0)
+                        + 0.08 * (u_enc_err * treated_mask_1d).mean()
+                        if has_ctrl_go
+                        else u_enc_err.mean()
+                    )
+                    l_go_pathway = l_go_pathway + 0.65 * l_u_enc
+            else:
+                if "u_cycle_go" in inference_outputs and inference_outputs["u_cycle_go"] is not None:
+                    u_go = inference_outputs["u_cycle_go"]
+                    l_go_pathway = l_go_pathway + F.mse_loss(u_go, emp_go_target)
+                if "u_cycle_go_enc" in inference_outputs and inference_outputs["u_cycle_go_enc"] is not None:
+                    u_go_enc = inference_outputs["u_cycle_go_enc"]
+                    l_go_pathway = l_go_pathway + 0.5 * F.mse_loss(u_go_enc, emp_go_target)
             l_go_pathway = self.lambda_go_pathway * l_go_pathway
             if (
                 self.lambda_ribbon_2d > 0.0
@@ -576,32 +850,113 @@ class PertVIModule(BaseModuleClass):
             ):
                 u_rib_target = inference_outputs["emp_ribbon_2d"].detach()
                 mu_xy = q_m_cycle[:, :2]
-                gamma_rib = inference_outputs.get("cycle_reliability_gate")
-                g_rib = (
-                    torch.clamp(gamma_rib.detach(), min=0.0, max=1.0)
-                    if gamma_rib is not None
-                    else torch.tensor(1.0, device=x.device, dtype=x.dtype)
-                )
                 r_mu = torch.sqrt(mu_xy.pow(2).sum(dim=-1) + 1e-6)
                 r_rib = torch.sqrt(u_rib_target.pow(2).sum(dim=-1) + 1e-6)
-                l_rad_rib = 0.5 * (1.8 * self.lambda_ribbon_2d) * ((r_mu - r_rib).pow(2).mean())
+                u_rib_dir = u_rib_target / torch.sqrt(u_rib_target.pow(2).sum(dim=-1, keepdim=True) + 0.04)
+
                 mu_sg = mu_xy.detach()
                 r2_sg = mu_sg.pow(2).sum(dim=-1, keepdim=True)
                 mu_tan = mu_xy - (((mu_xy - mu_sg) * mu_sg).sum(dim=-1, keepdim=True) / (r2_sg + 1e-6)) * mu_sg
                 u_mu_dir = mu_tan / torch.sqrt(r2_sg + 0.04)
-                u_rib_dir = u_rib_target / torch.sqrt(u_rib_target.pow(2).sum(dim=-1, keepdim=True) + 0.04)
-                l_ang_rib = 0.5 * (2.0 * self.lambda_ribbon_2d) * (
-                    (u_mu_dir - u_rib_dir).pow(2).sum(dim=-1).mean()
-                )
-                l_euc_null = 0.5 * (1.8 * self.lambda_ribbon_2d) * (
-                    (mu_xy - u_rib_target).pow(2).sum(dim=-1).mean()
-                )
-                w_polar = torch.clamp((g_rib - 0.15) / 0.35, min=0.0, max=1.0)
-                l_go_pathway = (
-                    l_go_pathway
-                    + w_polar * (l_rad_rib + l_ang_rib)
-                    + (1.0 - w_polar) * l_euc_null
-                )
+
+                if self.active_gate_ln and "z_cycle" in inference_outputs:
+                    z_xy = inference_outputs["z_cycle"][:, :2]
+                    l_euc_z = 0.5 * (1.8 * self.lambda_ribbon_2d) * (
+                        (z_xy - u_rib_target).pow(2).sum(dim=-1).mean()
+                    )
+
+                    film_r_ref = self.inference_net.split_film_transition
+                    u_rib_basal = u_rib_target
+                    if (
+                        sample_idx is not None
+                        and getattr(film_r_ref, "film_mode", "") == "m7_block_tt"
+                    ):
+                        s_nr = int(film_r_ref.n_samples)
+                        if (
+                            not hasattr(self, "_ema_rib_pert")
+                            or self._ema_rib_pert.shape != (s_nr, 2)
+                            or self._ema_rib_pert.device != x.device
+                        ):
+                            self._ema_rib_pert = torch.zeros(s_nr, 2, device=x.device, dtype=torch.float32)
+                            self._ema_rib_ctrl = torch.zeros(2, device=x.device, dtype=torch.float32)
+                            self._ema_rib_init = torch.zeros(s_nr, device=x.device, dtype=torch.float32)
+                            self._ema_rib_ctrl_init = False
+                        if self.training:
+                            with torch.no_grad():
+                                cm_r = control_mask_1d > 0.5
+                                if int(cm_r.sum().item()) >= 2:
+                                    cr_mean = u_rib_target[cm_r].float().mean(dim=0)
+                                    if not self._ema_rib_ctrl_init:
+                                        self._ema_rib_ctrl.copy_(cr_mean)
+                                        self._ema_rib_ctrl_init = True
+                                    else:
+                                        self._ema_rib_ctrl.mul_(0.95).add_(0.05 * cr_mean)
+                                for sv in torch.unique(sample_idx).tolist():
+                                    ms = sample_idx == sv
+                                    if int(ms.sum().item()) >= 2:
+                                        pr_mean = u_rib_target[ms].float().mean(dim=0)
+                                        if self._ema_rib_init[sv].item() == 0.0:
+                                            self._ema_rib_pert[sv].copy_(pr_mean)
+                                            self._ema_rib_init[sv] = 1.0
+                                        else:
+                                            self._ema_rib_pert[sv].mul_(0.90).add_(0.10 * pr_mean)
+                        if self._ema_rib_ctrl_init:
+                            sc_cnt = film_r_ref.sample_counts.to(device=x.device, dtype=torch.float32)
+                            w_sh_r = ((sc_cnt / (sc_cnt + 16.0)) * self._ema_rib_init).unsqueeze(-1)
+                            d_rib_all = w_sh_r * (self._ema_rib_pert - self._ema_rib_ctrl.unsqueeze(0))
+                            u_rib_basal = (
+                                u_rib_target
+                                - treated_mask_1d.unsqueeze(-1) * d_rib_all[sample_idx].to(dtype=u_rib_target.dtype)
+                            ).detach()
+
+                    u_rib_basal_dir = u_rib_basal / torch.sqrt(
+                        u_rib_basal.pow(2).sum(dim=-1, keepdim=True) + 0.04
+                    )
+
+                    ctrl_m_b = control_mask_1d > 0.5
+                    if int(ctrl_m_b.sum().item()) >= 4:
+                        r_ctrl_med = r_rib[ctrl_m_b].median().detach()
+                        r_basal_tgt = control_mask_1d * r_rib + treated_mask_1d * (
+                            0.65 * r_rib + 0.35 * r_ctrl_med
+                        )
+                    else:
+                        r_basal_tgt = r_rib
+
+                    l_rad_u = 0.5 * (1.8 * self.lambda_ribbon_2d) * ((r_mu - r_basal_tgt).pow(2).mean())
+                    n_ctrl_r = control_mask_1d.sum()
+                    ang_u_err = (u_mu_dir - u_rib_basal_dir).pow(2).sum(dim=-1)
+                    if float(n_ctrl_r.item()) >= 1.0:
+                        l_ang_u = 0.5 * (2.0 * self.lambda_ribbon_2d) * (
+                            0.85 * ((ang_u_err * control_mask_1d).sum() / n_ctrl_r.clamp(min=1.0))
+                            + 0.12 * (ang_u_err * treated_mask_1d).mean()
+                        )
+                    else:
+                        l_ang_u = 0.5 * (2.0 * self.lambda_ribbon_2d) * (0.25 * ang_u_err.mean())
+                    z_dir = z_xy / torch.sqrt(z_xy.pow(2).sum(dim=-1, keepdim=True) + 0.04)
+                    l_ang_z = 0.5 * (2.0 * self.lambda_ribbon_2d) * (
+                        (z_dir - u_rib_dir).pow(2).sum(dim=-1).mean()
+                    )
+                    l_euc_u = 0.5 * (1.8 * self.lambda_ribbon_2d) * (
+                        (mu_xy - u_rib_basal).pow(2).sum(dim=-1).mean()
+                    )
+                    l_go_pathway = (
+                        l_go_pathway
+                        + w_polar * (l_rad_u + l_ang_u + 0.45 * l_ang_z)
+                        + (1.0 - w_polar) * (0.5 * l_euc_z + 0.5 * l_euc_u)
+                    )
+                else:
+                    l_rad_rib = 0.5 * (1.8 * self.lambda_ribbon_2d) * ((r_mu - r_rib).pow(2).mean())
+                    l_ang_rib = 0.5 * (2.0 * self.lambda_ribbon_2d) * (
+                        (u_mu_dir - u_rib_dir).pow(2).sum(dim=-1).mean()
+                    )
+                    l_euc_null = 0.5 * (1.8 * self.lambda_ribbon_2d) * (
+                        (mu_xy - u_rib_target).pow(2).sum(dim=-1).mean()
+                    )
+                    l_go_pathway = (
+                        l_go_pathway
+                        + w_polar * (l_rad_rib + l_ang_rib)
+                        + (1.0 - w_polar) * l_euc_null
+                    )
 
         kl_local_unaggregated = kl_cycle_weighted + kl_state + kl_ood_final + kl_library
 
@@ -618,10 +973,44 @@ class PertVIModule(BaseModuleClass):
 
         if self.ood_all_cells_hsic and self.ortho_mode == "snr_harmonic_hsic":
             disentangle_ood_cycle = self._compute_disentangle_penalty(
-                q_m_ood, q_v_ood, q_m_cycle_detached, sample_idx=sample_idx
+                q_m_ood,
+                q_v_ood,
+                q_m_cycle_detached,
+                sample_idx=sample_idx,
+                zca_whiten=bool(self.active_gate_ln),
+            )
+            g_act_ood_hsic = (
+                self.inference_net.split_film_transition.get_snr_gates("state")[0].detach()
+                if (
+                    self.active_gate_ln
+                    and getattr(self.inference_net.split_film_transition, "film_mode", "") == "m7_block_tt"
+                )
+                else None
+            )
+            u_src_ood_hsic = (
+                inference_outputs["u_state_src"].detach()
+                if (self.active_gate_ln and "u_state_src" in inference_outputs)
+                else None
+            )
+            z_st_ood_hsic = (
+                inference_outputs["z_state"].detach()
+                if (self.active_gate_ln and "z_state" in inference_outputs)
+                else None
+            )
+            z_cyc_ood_hsic = (
+                inference_outputs["z_cycle"].detach()
+                if (self.active_gate_ln and "z_cycle" in inference_outputs)
+                else None
             )
             disentangle_ood_state = _snr_whitened_state_ood_hsic_penalty(
-                q_m_ood, q_v_ood, q_m_state_detached, q_v_state_detached
+                q_m_ood,
+                q_v_ood,
+                q_m_state_detached,
+                q_v_state_detached,
+                g_act_state=g_act_ood_hsic,
+                u_state_src_detached=u_src_ood_hsic,
+                z_state_detached=z_st_ood_hsic,
+                z_cycle_detached=z_cyc_ood_hsic,
             )
         else:
             ood_ortho_fn = _unbiased_hsic if self.ortho_mode == "hsic" else _linear_cov_penalty
@@ -642,7 +1031,7 @@ class PertVIModule(BaseModuleClass):
                 disentangle_ood_cycle = torch.tensor(0.0, device=x.device)
                 disentangle_ood_state = torch.tensor(0.0, device=x.device)
 
-        # --- Control Anchor on v_ood (Elastic L1+L2 or Smooth L2) ---
+        # --- Control Anchor on v_ood (Conditional Expectation over Control Distribution P(x | ctrl)) ---
         if self.ood_anchor_mode == "l2":
             ood_ctrl_penalty_per_cell = 0.5 * torch.sum(q_m_ood ** 2, dim=-1)
         else:
@@ -651,7 +1040,7 @@ class PertVIModule(BaseModuleClass):
             )
         ood_control_pen = ood_ctrl_penalty_per_cell * control_mask_1d
 
-        # --- Cross-Batch Centroid Alignment on Basal u_state ---
+        # --- Cross-Batch Centroid Alignment on Basal u_state / u_state_src ---
         l_batch_state = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         batch_idx = tensors.get("batch")
         if self.lambda_batch_state > 0.0 and batch_idx is not None:
@@ -660,22 +1049,89 @@ class PertVIModule(BaseModuleClass):
             if b_uniq.numel() >= 2:
                 mu_st_global = q_m_state.mean(dim=0)
                 n_tot_b = float(q_m_state.shape[0])
+                w_b_dim = torch.ones_like(mu_st_global)
+                if (
+                    self.active_gate_ln
+                    and getattr(self.inference_net.split_film_transition, "film_mode", "") == "m7_block_tt"
+                ):
+                    g_act_b = self.inference_net.split_film_transition.get_snr_gates("state")[0].detach()
+                    w_b_dim = g_act_b.to(device=x.device, dtype=x.dtype) + 0.15 * (
+                        1.0 - g_act_b.to(device=x.device, dtype=x.dtype)
+                    )
+                l_b_qm = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+                u_src_b = inference_outputs.get("u_state_src")
+                mu_src_global = u_src_b.mean(dim=0) if (self.active_gate_ln and u_src_b is not None) else None
                 for b_val in b_uniq:
                     mb = b_1d == b_val
                     nb = int(mb.sum().item())
                     if nb >= 4:
-                        l_batch_state = l_batch_state + (float(nb) / n_tot_b) * (
-                            (q_m_state[mb].mean(dim=0) - mu_st_global).pow(2).sum()
+                        wb = float(nb) / n_tot_b
+                        l_b_qm = l_b_qm + wb * (
+                            ((q_m_state[mb].mean(dim=0) - mu_st_global).pow(2) * w_b_dim).sum()
                         )
-                l_batch_state = self.lambda_batch_state * l_batch_state
+                        if mu_src_global is not None:
+                            u_mb = u_src_b[mb]
+                            l_b_qm = l_b_qm + 0.55 * wb * (
+                                (u_mb.mean(dim=0) - mu_src_global).pow(2).sum()
+                            )
+                l_batch_state = self.lambda_batch_state * l_b_qm
+
+        # --- Cross-Perturbation Basal Centroid Invariance on u_state / u_state_src (v0.4.3) ---
+        l_pert_state = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        if self.lambda_pert_state > 0.0 and sample_idx is not None:
+            film_mod_s = self.inference_net.split_film_transition
+            w_pert_st = (
+                film_mod_s._get_state_gate_warmup()
+                if getattr(film_mod_s, "film_mode", "") == "m7_block_tt"
+                else 1.0
+            )
+            if w_pert_st > 0.0:
+                l_mb_st = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+                ctrl_m_b = control_mask_1d > 0.5
+                mu_ref_st = (
+                    q_m_state[ctrl_m_b].mean(dim=0).detach()
+                    if int(ctrl_m_b.sum().item()) >= 6
+                    else q_m_state.mean(dim=0).detach()
+                )
+                n_grp_st = 0
+                for s_val in torch.unique(sample_idx):
+                    m_s = sample_idx == s_val
+                    n_s = int(m_s.sum().item())
+                    if n_s >= 6:
+                        q_s = q_m_state[m_s]
+                        var_deb_st = q_s.var(dim=0, unbiased=True).sum().detach() / float(n_s)
+                        l_mb_st = l_mb_st + F.relu((q_s.mean(dim=0) - mu_ref_st).pow(2).sum() - var_deb_st)
+                        n_grp_st += 1
+                if n_grp_st > 0:
+                    l_mb_st = l_mb_st / float(n_grp_st)
+
+                l_ema_st = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+                if (
+                    getattr(film_mod_s, "film_mode", "") == "m7_block_tt"
+                    and film_mod_s.ctrl_stats_init.item() > 0.0
+                    and "u_state_src" in inference_outputs
+                ):
+                    g_act_st, _ = film_mod_s.get_snr_gates("state")
+                    mu_hat_st = film_mod_s.get_shrunk_centroids("state")[sample_idx]
+                    ctrl_mu_st = film_mod_s.ctrl_mean_state.to(device=x.device, dtype=x.dtype).unsqueeze(0)
+                    dmu_st = (treated_mask_1d.unsqueeze(-1) * (mu_hat_st - ctrl_mu_st) * g_act_st.unsqueeze(0)).detach()
+                    u_st_pre = (
+                        film_mod_s._last_u_state_pre_deleak
+                        if getattr(film_mod_s, "_last_u_state_pre_deleak", None) is not None
+                        else inference_outputs["u_state_src"]
+                    )
+                    l_ema_st = (u_st_pre - (u_st_pre - dmu_st).detach()).pow(2).sum(dim=-1).mean()
+
+                l_pert_state = (self.lambda_pert_state * w_pert_st) * (0.5 * l_ema_st + 0.5 * l_mb_st)
 
         # --- Soft L1 penalty mask on main head ---
         cycle_mask_float = self.generative_net.cycle_gene_mask.float().unsqueeze(1)
         masked_weights = self.generative_net.main_head.weight * cycle_mask_float
         soft_l1_loss = torch.sum(torch.abs(masked_weights))
 
-        # --- Closed-Form Functional Prior on Active FiLM Operators ---
+        # --- Closed-Form Functional Prior on Active FiLM Operators & Smooth AM-GM Gauge Lock ---
         film_module = self.inference_net.split_film_transition
+        l_w_orth = torch.tensor(0.0, device=x.device, dtype=x.dtype)
         if getattr(film_module, "film_mode", "legacy_hadamard") == "m7_block_tt":
             n_total = max(1.0, float(film_module.n_obs_total.item()))
             film_prior_loss = (
@@ -685,6 +1141,32 @@ class PertVIModule(BaseModuleClass):
                 )
                 / n_total
             )
+            if self.lambda_w_orth > 0.0:
+                w_gate_st = film_module._get_state_gate_warmup()
+                if w_gate_st > 0.0:
+                    _, g_perp_w = film_module.get_snr_gates("state")
+                    n_treat_p = (
+                        float((film_module.is_control_sample < 0.5).sum().item())
+                        if film_module.is_control_sample.sum() > 0
+                        else float(film_module.n_samples)
+                    )
+                    lin0 = self.generative_net.main_hidden[0]
+                    w_main_st = lin0.weight[:, : self.n_latent_state]
+                    w_orth_cols = w_main_st * g_perp_w.detach().unsqueeze(0)
+                    gram_orth = w_orth_cols.t() @ w_orth_cols
+                    gram_off_diag = (gram_orth - torch.diag(torch.diagonal(gram_orth))).pow(2).sum()
+                    c_orth_sq_sum = w_orth_cols.pow(2).sum() + 2.5 * gram_off_diag
+                    if hasattr(lin0, "parametrizations") and "weight" in lin0.parametrizations:
+                        w_orig_st = lin0.parametrizations.weight.original[:, : self.n_latent_state]
+                        c_orth_sq_sum = c_orth_sq_sum + 0.05 * (
+                            (w_orig_st * g_perp_w.detach().unsqueeze(0)).pow(2).sum()
+                        )
+                    l_w_orth = (
+                        self.lambda_w_orth
+                        * w_gate_st
+                        * (max(1.0, n_treat_p) / n_total)
+                        * c_orth_sq_sum
+                    )
         else:
             film_prior_loss = torch.tensor(0.0, device=x.device)
 
@@ -693,30 +1175,43 @@ class PertVIModule(BaseModuleClass):
         lambda_adv_state = getattr(self, "current_lambda_adv_state", self.max_lambda_adv_state)
         lambda_adv_ood = getattr(self, "current_lambda_adv_ood", self.max_lambda_adv_ood)
         lambda_adv_state_ood = (
-            0.5 * lambda_adv_ood
+            0.75 * lambda_adv_ood
             if (self.ood_all_cells_hsic and self.ortho_mode == "snr_harmonic_hsic")
             else 5.0
         )
         lambda_ood_anchor = getattr(self, "current_lambda_ood", self.max_lambda_ood)
         lambda_soft = self.lambda_soft
 
-        base_loss_unaggregated = (
-            reconst_loss
-            + (lambda_kl * kl_local_unaggregated)
-            + (lambda_ood_anchor * ood_control_pen)
-        )
+        if self.active_gate_ln and self.split_ood_decoder:
+            n_ctrl_mb = control_mask_1d.sum()
+            l_ood_ctrl_cond = (
+                lambda_ood_anchor * (ood_control_pen.sum() / n_ctrl_mb.clamp(min=1.0))
+                if float(n_ctrl_mb.item()) > 0.0
+                else torch.tensor(0.0, device=x.device, dtype=x.dtype)
+            )
+            base_loss_unaggregated = reconst_loss + (lambda_kl * kl_local_unaggregated)
+        else:
+            l_ood_ctrl_cond = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+            base_loss_unaggregated = (
+                reconst_loss
+                + (lambda_kl * kl_local_unaggregated)
+                + (lambda_ood_anchor * ood_control_pen)
+            )
 
         total_loss = (
             torch.mean(base_loss_unaggregated)
+            + l_ood_ctrl_cond
             + l_circ
             + l_drug_cycle
             + l_go_pathway
             + l_batch_state
+            + l_pert_state
             + (lambda_adv_state * disentangle_state_cycle)
             + (lambda_adv_ood * disentangle_ood_cycle)
             + (lambda_adv_state_ood * disentangle_ood_state)
             + (lambda_soft * soft_l1_loss)
             + film_prior_loss
+            + l_w_orth
         )
 
         return LossOutput(
@@ -729,6 +1224,7 @@ class PertVIModule(BaseModuleClass):
                 "covariance_penalty_ood": disentangle_ood_cycle,
                 "covariance_penalty_state_ood": disentangle_ood_state,
                 "go_pathway_loss": l_go_pathway,
+                "pert_state_align_loss": l_pert_state,
                 "soft_l1_penalty": soft_l1_loss,
                 "film_prior_loss": film_prior_loss,
                 "v_ood_active_fraction": torch.mean((torch.abs(q_m_ood) > 0.5).float()),

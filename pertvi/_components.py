@@ -13,15 +13,23 @@ from scvi.nn import Encoder
 # Decoder Column Max-Norm Parametrization
 # ==========================================
 class MaxColNorm(nn.Module):
-    """Bounds each column norm of a Linear weight matrix: ||W[:, d]||_2 <= max_col_norm."""
+    """Bounds each column norm of a Linear weight matrix: ||W[:, d]||_2 <= max_col_norm (or per-column bound)."""
 
     def __init__(self, max_col_norm: float = 2.0):
         super().__init__()
         self.max_col_norm = float(max_col_norm)
+        self.register_buffer("_col_max_vec", None, persistent=False)
+
+    def set_col_max_vec(self, col_max_vec: Optional[torch.Tensor]) -> None:
+        self._col_max_vec = col_max_vec.detach() if col_max_vec is not None else None
 
     def forward(self, W: torch.Tensor) -> torch.Tensor:
         col_norms = torch.sqrt(W.pow(2).sum(dim=0, keepdim=True) + 1e-12)
-        scale = (col_norms / self.max_col_norm).clamp(min=1.0)
+        if self._col_max_vec is not None and self._col_max_vec.numel() == W.shape[1]:
+            bound = self._col_max_vec.to(device=W.device, dtype=W.dtype).unsqueeze(0)
+        else:
+            bound = self.max_col_norm
+        scale = (col_norms / bound).clamp(min=1.0)
         return W / scale
 
 
@@ -477,6 +485,11 @@ class SplitNaturalShiftFiLM(nn.Module):
         n_obs_total: int = 1,
         sample_counts: Optional[torch.Tensor] = None,
         is_control_sample: Optional[torch.Tensor] = None,
+        max_active_basal_dims: Optional[int] = None,
+        active_gate_ln: bool = False,
+        deleak_basal_state: bool = False,
+        state_orth_max_shift_norm: Optional[float] = None,
+        u_ood_dim: int = 0,
     ):
         super().__init__()
         if transition_mode is not None:
@@ -493,6 +506,7 @@ class SplitNaturalShiftFiLM(nn.Module):
 
         self.u_cycle_dim = int(u_cycle_dim)
         self.u_state_dim = int(u_state_dim)
+        self.u_ood_dim = int(u_ood_dim)
         self.drug_embed_dim = int(drug_embed_dim)
         self.film_mode = film_mode
         self.transition_mode = film_mode
@@ -504,12 +518,20 @@ class SplitNaturalShiftFiLM(nn.Module):
         self.lambda_gamma_cycle = (
             float(lambda_gamma_cycle)
             if lambda_gamma_cycle is not None
-            else (0.02 if cycle_norm_mode == "natural_identity" else float(lambda_gamma_state))
+            else (
+                (0.015 if bool(active_gate_ln) else 0.02)
+                if cycle_norm_mode == "natural_identity"
+                else float(lambda_gamma_state)
+            )
         )
         self.lambda_alpha_cycle = (
             float(lambda_alpha_cycle)
             if lambda_alpha_cycle is not None
-            else (0.008 if cycle_norm_mode == "natural_identity" else float(lambda_alpha_state))
+            else (
+                (0.008 if bool(active_gate_ln) else 0.008)
+                if cycle_norm_mode == "natural_identity"
+                else float(lambda_alpha_state)
+            )
         )
 
         if film_mode == "legacy_hadamard":
@@ -546,6 +568,31 @@ class SplitNaturalShiftFiLM(nn.Module):
         self.eta0 = float(eta0)
         self.eps_iso = float(eps_iso)
         self.ln_eps = float(ln_eps)
+        self.max_active_basal_dims = (
+            int(max_active_basal_dims) if max_active_basal_dims is not None else None
+        )
+        self.active_gate_ln = bool(active_gate_ln)
+        self.deleak_basal_state = bool(deleak_basal_state)
+        self.state_orth_max_shift_norm = (
+            float(state_orth_max_shift_norm)
+            if (state_orth_max_shift_norm is not None and float(state_orth_max_shift_norm) > 0.0)
+            else None
+        )
+        self.register_buffer(
+            "state_gate_steps", torch.tensor(0.0, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_kl_prog", torch.tensor(0.0, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_kl_prog_seen", torch.tensor(0.0, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_train_prog", torch.tensor(0.0, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_train_prog_seen", torch.tensor(0.0, dtype=torch.float32), persistent=False
+        )
 
         self.norm_weight_cycle = nn.Parameter(torch.ones(D_cyc))
         self.norm_weight_state = nn.Parameter(torch.ones(D_st))
@@ -578,12 +625,35 @@ class SplitNaturalShiftFiLM(nn.Module):
             self.register_buffer(f"pool_cov_{ch}", torch.eye(D_c, dtype=torch.float32))
             self.register_buffer(f"pert_means_{ch}", torch.zeros(S, D_c, dtype=torch.float32))
 
+        if self.active_gate_ln and self.u_ood_dim > 0:
+            D_ood = self.u_ood_dim
+            D_b_ood = 2 * D_st + D_cyc + 12
+            self.register_buffer("ctrl_mean_ood", torch.zeros(D_ood, dtype=torch.float32))
+            self.register_buffer("pert_means_ood", torch.zeros(S, D_ood, dtype=torch.float32))
+            self.register_buffer("pert_ood_init", torch.zeros(S, dtype=torch.float32))
+            self.register_buffer("ctrl_ood_init", torch.tensor(0.0, dtype=torch.float32))
+            self.register_buffer("pool_mean_b_ood", torch.zeros(D_b_ood, dtype=torch.float32))
+            self.register_buffer("pool_cov_bb_ood", torch.eye(D_b_ood, dtype=torch.float32) * 0.05)
+            self.register_buffer("pool_cov_bv_ood", torch.zeros(D_b_ood, D_ood, dtype=torch.float32))
+            self.register_buffer("pool_b_ood_init", torch.tensor(0.0, dtype=torch.float32))
+
         self.emb_gamma = nn.Embedding(S, self.drug_embed_dim)
         self.emb_alpha = nn.Embedding(S, self.drug_embed_dim)
+        if self.active_gate_ln:
+            cyc_emb_dim = min(8, self.drug_embed_dim)
+            self.emb_gamma_cycle = nn.Embedding(S, cyc_emb_dim)
+            self.emb_alpha_cycle = nn.Embedding(S, cyc_emb_dim)
+            nn.init.normal_(self.emb_gamma.weight, mean=0.0, std=1.25)
+            nn.init.normal_(self.emb_alpha.weight, mean=0.0, std=1.25)
+            nn.init.normal_(self.emb_gamma_cycle.weight, mean=0.0, std=1.15)
+            nn.init.normal_(self.emb_alpha_cycle.weight, mean=0.0, std=1.15)
+        else:
+            cyc_emb_dim = self.drug_embed_dim
+        self._last_u_state_pre_deleak: Optional[torch.Tensor] = None
 
-        self.gamma_par_cycle = nn.Linear(self.drug_embed_dim, D_cyc, bias=False)
-        self.gamma_perp_cycle = nn.Linear(self.drug_embed_dim, R_cyc, bias=False)
-        self.alpha_cycle = nn.Linear(self.drug_embed_dim, D_cyc, bias=False)
+        self.gamma_par_cycle = nn.Linear(cyc_emb_dim, D_cyc, bias=False)
+        self.gamma_perp_cycle = nn.Linear(cyc_emb_dim, R_cyc, bias=False)
+        self.alpha_cycle = nn.Linear(cyc_emb_dim, D_cyc, bias=False)
         self.V_read_cycle = nn.Linear(D_cyc, R_cyc, bias=False)
         self.U_write_cycle = nn.Linear(R_cyc, D_cyc, bias=False)
 
@@ -615,6 +685,32 @@ class SplitNaturalShiftFiLM(nn.Module):
         return self.norm_weight_state
 
     # --- Normalization Helpers ---
+    def set_kl_warmup_progress(
+        self, kl_weight: float, train_progress: Optional[float] = None
+    ) -> None:
+        if not hasattr(self, "_kl_prog"):
+            return
+        with torch.no_grad():
+            self._kl_prog.fill_(float(min(1.0, max(0.0, kl_weight))))
+            self._kl_prog_seen.fill_(1.0)
+            if train_progress is not None and hasattr(self, "_train_prog"):
+                self._train_prog.fill_(float(min(1.0, max(0.0, train_progress))))
+                self._train_prog_seen.fill_(1.0)
+
+    def _get_state_gate_warmup(self) -> float:
+        if self.training:
+            if self._kl_prog_seen.item() > 0.0:
+                return float(min(1.0, max(0.0, (self._kl_prog.item() - 0.25) / 0.75)))
+            return float(min(1.0, max(0.0, (self.state_gate_steps.item() - 120.0) / 360.0)))
+        return 1.0 if self.ctrl_stats_init.item() > 0.0 else 0.0
+
+    def _get_deleak_warmup(self) -> float:
+        if self.training:
+            if hasattr(self, "_train_prog_seen") and self._train_prog_seen.item() > 0.0:
+                return 0.86 * float(min(1.0, max(0.0, (self._train_prog.item() - 0.32) / 0.20)))
+            return 0.86 * self._get_state_gate_warmup()
+        return 0.86 if self.ctrl_stats_init.item() > 0.0 else 0.0
+
     def _normalize_stochastic(
         self,
         subspace_or_u: Union[str, torch.Tensor],
@@ -639,6 +735,19 @@ class SplitNaturalShiftFiLM(nn.Module):
                 rms = torch.sqrt(u.pow(2).mean(dim=-1, keepdim=True) + self.ln_eps)
                 return (u / rms) * w
 
+        if subspace == "state" and self.active_gate_ln:
+            w_gate = self._get_state_gate_warmup()
+            g_act, _ = self.get_snr_gates("state")
+            g_norm = ((1.0 - w_gate) + w_gate * g_act.detach()).to(device=u.device, dtype=u.dtype)
+            d_eff = g_norm.sum().clamp(min=1.0)
+            p_norm = (g_norm / d_eff).unsqueeze(0)
+            mean = (u * p_norm).sum(dim=-1, keepdim=True)
+            var = ((u - mean).pow(2) * p_norm).sum(dim=-1, keepdim=True)
+            w_pos = w.clamp(min=0.55, max=1.65)
+            w_rms = torch.sqrt((w_pos.pow(2) * p_norm.squeeze(0)).sum() + 1e-8)
+            w_eff = 1.10 * (w_pos / w_rms)
+            return ((u - mean) / torch.sqrt(var + self.ln_eps)) * (w_eff * g_norm)
+
         mean = u.mean(dim=-1, keepdim=True)
         var = u.var(dim=-1, unbiased=False, keepdim=True)
         return ((u - mean) / torch.sqrt(var + self.ln_eps)) * w
@@ -655,6 +764,30 @@ class SplitNaturalShiftFiLM(nn.Module):
                 if self.deleak_radial_cycle:
                     return q_m / self.r_star_cycle
                 return (q_m / self.r_star_cycle) * weight
+
+        if channel == "state" and self.active_gate_ln:
+            w_gate = self._get_state_gate_warmup()
+            g_act, _ = self.get_snr_gates("state")
+            g_norm = ((1.0 - w_gate) + w_gate * g_act.detach()).to(
+                device=q_m.device, dtype=q_m.dtype
+            )
+            d_eff = g_norm.sum().clamp(min=1.0)
+            p_norm = (g_norm / d_eff).unsqueeze(0)
+            if self.ctrl_stats_init.item() > 0.0 or q_v is None:
+                qv_t = self.ctrl_qv_mean_state.to(device=q_m.device, dtype=q_m.dtype).unsqueeze(0)
+                qv_bar = (qv_t * p_norm).sum(dim=-1, keepdim=True)
+            else:
+                qv_t = q_v.to(device=q_m.device, dtype=q_m.dtype)
+                qv_bar = (qv_t * p_norm).sum(dim=-1, keepdim=True)
+            mean = (q_m * p_norm).sum(dim=-1, keepdim=True)
+            var = ((q_m - mean).pow(2) * p_norm).sum(dim=-1, keepdim=True)
+            matched_var = var + ((d_eff - 1.0) / d_eff).clamp(min=0.0) * qv_bar
+            w_pos = weight.clamp(min=0.55, max=1.65)
+            w_rms = torch.sqrt((w_pos.pow(2) * p_norm.squeeze(0)).sum() + 1e-8)
+            w_eff = 1.10 * (w_pos / w_rms)
+            return ((q_m - mean) / torch.sqrt(matched_var + self.ln_eps)) * (
+                w_eff * g_norm
+            )
 
         if q_v is not None:
             qv_bar = q_v.to(device=q_m.device, dtype=q_m.dtype).mean(dim=-1, keepdim=True)
@@ -694,7 +827,29 @@ class SplitNaturalShiftFiLM(nn.Module):
         else:
             snr = self.get_snr(channel)
             snr_sq = snr.pow(2)
-            g_act = snr_sq / (snr_sq + (self.tau_snr ** 2))
+            g_raw = snr_sq / (snr_sq + (self.tau_snr ** 2))
+            if channel == "state" and (self.max_active_basal_dims is not None or self.active_gate_ln):
+                active_mask = torch.ones_like(g_raw)
+                if (
+                    self.max_active_basal_dims is not None
+                    and 0 < self.max_active_basal_dims < g_raw.numel()
+                ):
+                    topk_idx = torch.topk(snr, k=self.max_active_basal_dims).indices
+                    top_mask = torch.zeros_like(g_raw)
+                    top_mask.scatter_(0, topk_idx, 1.0)
+                    active_mask = active_mask * top_mask
+                w_gate = self._get_state_gate_warmup()
+                if self.active_gate_ln and (not self.training) and w_gate >= 1.0:
+                    cand_mask = active_mask * (g_raw > 0.5).to(g_raw.dtype)
+                    if cand_mask.sum().item() < 1.0:
+                        cand_mask = torch.zeros_like(g_raw)
+                        cand_mask[torch.argmax(snr)] = 1.0
+                    eff_mask = cand_mask
+                else:
+                    eff_mask = (1.0 - w_gate) + w_gate * active_mask
+                g_act = g_raw * eff_mask
+            else:
+                g_act = g_raw
         g_perp = 1.0 - g_act
         return g_act, g_perp
 
@@ -713,9 +868,15 @@ class SplitNaturalShiftFiLM(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         V_read = getattr(self, f"V_read_{channel}")
         U_write = getattr(self, f"U_write_{channel}")
-        V_hat = F.normalize(V_read.weight, dim=1) * g_act.unsqueeze(0)
+        if channel == "state" and self.active_gate_ln:
+            V_tilde = V_read.weight * g_act.unsqueeze(0)
+            row_norms = torch.sqrt(V_tilde.pow(2).sum(dim=1, keepdim=True) + 1e-12).clamp(min=0.80)
+            V_hat = V_tilde / row_norms
+        else:
+            V_hat = F.normalize(V_read.weight, dim=1) * g_act.unsqueeze(0)
         U_tilde = g_perp.unsqueeze(1) * U_write.weight
-        col_norms = torch.sqrt(U_tilde.pow(2).sum(dim=0, keepdim=True) + 1e-12).clamp(min=1.0)
+        min_col = 0.15 if (channel == "state" and self.active_gate_ln) else 1.0
+        col_norms = torch.sqrt(U_tilde.pow(2).sum(dim=0, keepdim=True) + 1e-12).clamp(min=min_col)
         U_hat = U_tilde / col_norms
         return V_hat, U_hat
 
@@ -831,10 +992,22 @@ class SplitNaturalShiftFiLM(nn.Module):
 
         mu_hat_all = self.get_shrunk_centroids(channel)
         mu_hat = mu_hat_all[sample_idx]
-        u_check = u_src - mu_hat
+        if (
+            channel == "state"
+            and self.deleak_basal_state
+            and self._last_u_state_pre_deleak is not None
+            and self._last_u_state_pre_deleak.shape == u_src.shape
+        ):
+            u_check = self._last_u_state_pre_deleak - mu_hat
+        else:
+            u_check = u_src - mu_hat
 
-        e_gamma = self.emb_gamma(sample_idx)
-        e_alpha = self.emb_alpha(sample_idx)
+        if channel == "cycle" and hasattr(self, "emb_gamma_cycle"):
+            e_gamma = self.emb_gamma_cycle(sample_idx)
+            e_alpha = self.emb_alpha_cycle(sample_idx)
+        else:
+            e_gamma = self.emb_gamma(sample_idx)
+            e_alpha = self.emb_alpha(sample_idx)
 
         gamma_par = getattr(self, f"gamma_par_{channel}")(e_gamma)
         gamma_perp = getattr(self, f"gamma_perp_{channel}")(e_gamma)
@@ -842,14 +1015,15 @@ class SplitNaturalShiftFiLM(nn.Module):
 
         g_act, g_perp = self.get_snr_gates(channel)
         V_hat, U_hat = self.get_effective_bases(channel, g_act, g_perp)
-        alpha_eff = (g_act[:2].mean() * alpha) if (channel == "cycle" and g_act.numel() >= 2) else alpha
+        if channel == "cycle" and g_act.numel() >= 2:
+            alpha_eff = g_act[:2].mean() * alpha
+        elif channel == "state" and self.active_gate_ln:
+            alpha_eff = (0.14 * g_act + g_perp).unsqueeze(0) * alpha
+        else:
+            alpha_eff = alpha
 
         if channel == "cycle" and self.cycle_norm_mode == "natural_identity" and self.deleak_radial_cycle:
             if u_src.shape[-1] == 3:
-                plane_scale = torch.tensor([[1.0, 1.0, 0.05]], device=u_src.device, dtype=u_src.dtype)
-                delta_tan_ring = (g_act.unsqueeze(0) * gamma_par) * u_src
-                delta_perp_ring = F.linear(gamma_perp * F.linear(u_src, V_hat), U_hat)
-                delta_z = c_film * (delta_tan_ring + delta_perp_ring + alpha_eff) * plane_scale
                 r2_cur = u_src[:, 0:1].pow(2) + u_src[:, 1:2].pow(2)
                 r0_rad_sq = 0.25 ** 2
                 r_cur = torch.sqrt(r2_cur + 1e-8)
@@ -860,11 +1034,37 @@ class SplitNaturalShiftFiLM(nn.Module):
                 dr_leak = (self.pert_r_mean_cycle[sample_idx] - self.ctrl_r_mean_cycle).unsqueeze(-1)
                 u_base_clean = u_src - c_film * (dr_leak * e_rad_smooth).detach()
                 u_xy = u_base_clean[:, 0:2]
-                r_u = torch.sqrt(u_xy.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
-                z_raw_xy = u_xy + delta_z[:, 0:2]
-                z_retr_xy = r_u * (z_raw_xy / torch.sqrt(z_raw_xy.pow(2).sum(dim=-1, keepdim=True) + 1e-6))
-                z_xy = torch.where(c_film > 0.5, z_retr_xy, u_src[:, 0:2])
-                z_z2 = u_src[:, 2:3]
+                if self.active_gate_ln:
+                    cyc_gate = g_act[:2].mean().detach()
+                    delta_tan_ring = (g_act.unsqueeze(0) * gamma_par) * u_src
+                    delta_perp_ring = F.linear(gamma_perp * F.linear(u_src, V_hat), U_hat)
+                    raw_cyc_shift = delta_tan_ring + delta_perp_ring + alpha_eff
+                    raw_xy = raw_cyc_shift[:, 0:2]
+                    r_raw = torch.sqrt(raw_xy.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
+                    dz_xy = c_film * cyc_gate * (0.48 * torch.tanh(1.65 * r_raw) * (raw_xy / r_raw))
+                    dz_z2 = c_film * cyc_gate * (0.29 * torch.tanh(1.35 * raw_cyc_shift[:, 2:3]))
+
+                    u_sg = u_xy.detach()
+                    ru2_sg = u_sg.pow(2).sum(dim=-1, keepdim=True)
+                    w_tan_u = ru2_sg / (ru2_sg + 0.04)
+                    rad_proj_u = w_tan_u * (((u_xy - u_sg) * u_sg).sum(dim=-1, keepdim=True) / (ru2_sg + 1e-6))
+                    u_xy_tan_only = u_xy - rad_proj_u * u_sg
+                    u_ctrl_xy = u_src[:, 0:2] + (u_xy_tan_only - u_xy_tan_only.detach())
+
+                    z_xy = torch.where(c_film > 0.5, u_xy_tan_only + dz_xy, u_ctrl_xy)
+                    u_z2_st = u_src[:, 2:3].detach()
+                    u_ctrl_z2 = u_src[:, 2:3] + (u_z2_st - u_src[:, 2:3]).detach()
+                    z_z2 = torch.where(c_film > 0.5, u_z2_st + dz_z2, u_ctrl_z2)
+                else:
+                    plane_scale = torch.tensor([[1.0, 1.0, 0.05]], device=u_src.device, dtype=u_src.dtype)
+                    delta_tan_ring = (g_act.unsqueeze(0) * gamma_par) * u_src
+                    delta_perp_ring = F.linear(gamma_perp * F.linear(u_src, V_hat), U_hat)
+                    delta_z = c_film * (delta_tan_ring + delta_perp_ring + alpha_eff) * plane_scale
+                    z_raw_xy = u_xy + delta_z[:, 0:2]
+                    r_u = torch.sqrt(u_xy.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
+                    z_retr_xy = r_u * (z_raw_xy / torch.sqrt(z_raw_xy.pow(2).sum(dim=-1, keepdim=True) + 1e-6))
+                    z_xy = torch.where(c_film > 0.5, z_retr_xy, u_src[:, 0:2])
+                    z_z2 = u_src[:, 2:3]
                 return torch.cat([z_xy, z_z2], dim=-1)
             else:
                 delta_tan_ring = (g_act.unsqueeze(0) * gamma_par) * u_src
@@ -874,7 +1074,28 @@ class SplitNaturalShiftFiLM(nn.Module):
 
         delta_tan = (g_act.unsqueeze(0) * gamma_par) * u_check
         delta_perp = F.linear(gamma_perp * F.linear(u_check, V_hat), U_hat)
-        delta_z = c_film * (delta_tan + delta_perp + alpha_eff)
+        raw_delta = delta_tan + delta_perp + alpha_eff
+        if channel == "state" and (
+            self.active_gate_ln
+            or (self.state_orth_max_shift_norm is not None and self.state_orth_max_shift_norm > 0.0)
+        ):
+            g_act_1 = g_act.unsqueeze(0)
+            g_perp_1 = g_perp.unsqueeze(0)
+            d_act_part = g_act_1 * raw_delta
+            if self.active_gate_ln:
+                r_act = torch.sqrt(d_act_part.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
+                d_act_part = (0.36 * torch.tanh(r_act / 0.36)) * (d_act_part / r_act)
+            d_orth_raw = g_perp_1 * raw_delta
+            if self.state_orth_max_shift_norm is not None and self.state_orth_max_shift_norm > 0.0:
+                r_max_orth = float(self.state_orth_max_shift_norm)
+                r_orth = torch.sqrt(d_orth_raw.pow(2).sum(dim=-1, keepdim=True) + 1e-8)
+                r_cap = (r_max_orth - F.softplus(3.0 * (r_max_orth - r_orth)) / 3.0).clamp(min=0.0)
+                d_orth_part = r_cap * (d_orth_raw / r_orth)
+            else:
+                d_orth_part = d_orth_raw
+            delta_z = c_film * (d_act_part + d_orth_part)
+        else:
+            delta_z = c_film * raw_delta
         return u_src + delta_z
 
     def _modulate_eval_helper(
@@ -986,9 +1207,26 @@ class SplitNaturalShiftFiLM(nn.Module):
                     )
             u_cycle_src = self._normalize_stochastic("cycle", u_cycle)
             u_state_src = self._normalize_stochastic("state", u_state)
+            with torch.no_grad():
+                self.state_gate_steps.add_(1.0)
         else:
             u_cycle_src = self._normalize_matched("cycle", q_m_cycle, q_v=q_v_cycle)
             u_state_src = self._normalize_matched("state", q_m_state, q_v=q_v_state)
+
+        self._last_u_state_pre_deleak = u_state_src
+        if self.deleak_basal_state and self.ctrl_stats_init.item() > 0.0:
+            w_deleak = self._get_deleak_warmup()
+            if w_deleak > 0.0:
+                g_act_dl, _ = self.get_snr_gates("state")
+                mu_hat_dl = self.get_shrunk_centroids("state")[sample_idx]
+                ctrl_mu_dl = self.ctrl_mean_state.to(
+                    device=u_state_src.device, dtype=u_state_src.dtype
+                ).unsqueeze(0)
+                u_state_src = (
+                    u_state_src
+                    - (w_deleak * c_film)
+                    * ((mu_hat_dl - ctrl_mu_dl) * g_act_dl.unsqueeze(0)).detach()
+                )
 
         z_cycle = self._modulate_channel("cycle", u_cycle_src, sample_idx, c_film)
         z_state = self._modulate_channel("state", u_state_src, sample_idx, c_film)
@@ -996,6 +1234,192 @@ class SplitNaturalShiftFiLM(nn.Module):
         if return_src:
             return z_cycle, z_state, u_cycle_src, u_state_src
         return z_cycle, z_state
+
+    def _get_ood_cond_warmup(self) -> float:
+        if not (self.active_gate_ln and self.u_ood_dim > 0 and hasattr(self, "ctrl_ood_init")):
+            return 0.0
+        if self.ctrl_ood_init.item() <= 0.0 or self.pool_b_ood_init.item() <= 0.0:
+            return 0.0
+        if self.training:
+            if hasattr(self, "_train_prog_seen") and self._train_prog_seen.item() > 0.0:
+                return float(min(1.0, max(0.0, (self._train_prog.item() - 0.65) / 0.25)))
+            return 0.0
+        return 1.0
+
+    def condition_ood_latent(
+        self,
+        q_m_ood: torch.Tensor,
+        v_ood: torch.Tensor,
+        u_cycle_src: torch.Tensor,
+        u_state_src: torch.Tensor,
+        sample_or_embed: torch.Tensor,
+        w_enc_ood: torch.Tensor,
+        is_treated: Optional[torch.Tensor] = None,
+        u_cycle_go_enc: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self.film_mode != "m7_block_tt"
+            or (not self.active_gate_ln)
+            or self.u_ood_dim <= 0
+            or (not hasattr(self, "ctrl_mean_ood"))
+            or q_m_ood.shape[0] == 0
+        ):
+            return q_m_ood, v_ood
+
+        orig_dev = q_m_ood.device
+        orig_dtype = q_m_ood.dtype
+        dev = self.ctrl_mean_ood.device
+        n_b = int(q_m_ood.shape[0])
+        sample_idx = sample_or_embed.reshape(-1).to(device=dev, dtype=torch.long)
+
+        with torch.no_grad():
+            w_f = w_enc_ood.detach().to(device=dev, dtype=torch.float32)
+            u_w, s_w, _ = torch.linalg.svd(w_f, full_matrices=False)
+            if s_w.numel() > 0 and float(s_w[0].item()) > 1e-6:
+                keep = s_w > (0.18 * s_w[0])
+                if not bool(keep.any()):
+                    keep[0] = True
+                u_keep = u_w[:, keep]
+                P_act = u_keep @ u_keep.T
+            else:
+                P_act = torch.eye(self.u_ood_dim, device=dev, dtype=torch.float32)
+
+            v_d = q_m_ood.detach().to(device=dev, dtype=torch.float32)
+            u_st_d = u_state_src.detach().to(device=dev, dtype=torch.float32)
+            u_cyc_d = u_cycle_src.detach().to(device=dev, dtype=torch.float32)
+
+            g_act_st, _ = self.get_snr_gates("state")
+            ctrl_mu_st = self.ctrl_mean_state.to(device=dev, dtype=torch.float32).unsqueeze(0)
+            u_st_sq = ((u_st_d - ctrl_mu_st).pow(2)) * g_act_st.detach().to(
+                device=dev, dtype=torch.float32
+            ).unsqueeze(0)
+
+            if u_cyc_d.shape[-1] == 3:
+                phi_cyc_raw = expand_cylindrical_harmonics(
+                    u_cyc_d, harmonic_basis_mode="soft_unit_ribbon"
+                )
+            else:
+                phi_cyc_raw = u_cyc_d
+            if phi_cyc_raw.shape[-1] == 6:
+                phi_cyc_6 = phi_cyc_raw
+            elif phi_cyc_raw.shape[-1] > 6:
+                phi_cyc_6 = phi_cyc_raw[:, :6]
+            else:
+                phi_cyc_6 = F.pad(phi_cyc_raw, (0, 6 - phi_cyc_raw.shape[-1]))
+
+            if u_cycle_go_enc is not None:
+                u_go_raw = u_cycle_go_enc.detach().to(device=dev, dtype=torch.float32)
+                if u_go_raw.shape[-1] == 6:
+                    u_go_6 = u_go_raw
+                elif u_go_raw.shape[-1] > 6:
+                    u_go_6 = u_go_raw[:, :6]
+                else:
+                    u_go_6 = F.pad(u_go_raw, (0, 6 - u_go_raw.shape[-1]))
+            else:
+                u_go_6 = torch.zeros((n_b, 6), device=dev, dtype=torch.float32)
+
+            b_vec = torch.cat([u_st_d, u_st_sq, u_cyc_d, phi_cyc_6, u_go_6], dim=-1)
+
+            if self.is_control_sample.sum() > 0:
+                ctrl_mask = self.is_control_sample[sample_idx] > 0.5
+                is_ctrl_s = self.is_control_sample
+            elif is_treated is not None:
+                ctrl_mask = is_treated.reshape(-1).to(device=dev) < 0.5
+                is_ctrl_s = torch.zeros_like(self.sample_counts)
+            else:
+                ctrl_mask = torch.zeros_like(sample_idx, dtype=torch.bool)
+                is_ctrl_s = torch.zeros_like(self.sample_counts)
+
+            if self.training:
+                n0 = int(ctrl_mask.sum().item())
+                if n0 >= 2 or (n0 == 1 and self.ctrl_ood_init.item() == 0.0):
+                    rho0 = 1.0 - ((1.0 - self.eta0) ** n0)
+                    m0 = v_d[ctrl_mask].mean(dim=0)
+                    if self.ctrl_ood_init.item() == 0.0:
+                        self.ctrl_mean_ood.copy_(m0)
+                        self.ctrl_ood_init.fill_(1.0)
+                    else:
+                        self.ctrl_mean_ood.mul_(1.0 - rho0).add_(rho0 * m0)
+
+                for p_val in torch.unique(sample_idx).tolist():
+                    pm = sample_idx == p_val
+                    np_b = int(pm.sum().item())
+                    if np_b >= 1:
+                        rho_p = 1.0 - ((1.0 - self.eta0) ** np_b)
+                        mp = v_d[pm].mean(dim=0)
+                        if self.pert_ood_init[p_val].item() == 0.0:
+                            self.pert_means_ood[p_val].copy_(mp)
+                            self.pert_ood_init[p_val] = 1.0
+                        else:
+                            self.pert_means_ood[p_val].mul_(1.0 - rho_p).add_(rho_p * mp)
+
+                if n_b >= 4 and self.ctrl_ood_init.item() > 0.0:
+                    rho_pool = 0.025
+                    w_sh_upd = (
+                        (self.sample_counts / (self.sample_counts + 20.0))
+                        * self.pert_ood_init
+                        * (1.0 - is_ctrl_s)
+                    ).unsqueeze(-1)
+                    mu_hat_upd = (
+                        w_sh_upd[sample_idx]
+                        * (self.pert_means_ood[sample_idx] - self.ctrl_mean_ood.unsqueeze(0))
+                    ) @ P_act
+                    r_within_upd = ((v_d - self.ctrl_mean_ood.unsqueeze(0)) @ P_act) - mu_hat_upd
+                    bm = b_vec.mean(dim=0)
+                    db_upd = b_vec - bm.unsqueeze(0)
+                    cov_bb = (db_upd.T @ db_upd) / float(n_b)
+                    cov_bv = (db_upd.T @ r_within_upd) / float(n_b)
+                    if self.pool_b_ood_init.item() == 0.0:
+                        self.pool_mean_b_ood.copy_(bm)
+                        self.pool_cov_bb_ood.copy_(cov_bb)
+                        self.pool_cov_bv_ood.copy_(cov_bv)
+                        self.pool_b_ood_init.fill_(1.0)
+                    else:
+                        self.pool_mean_b_ood.mul_(1.0 - rho_pool).add_(rho_pool * bm)
+                        self.pool_cov_bb_ood.mul_(1.0 - rho_pool).add_(rho_pool * cov_bb)
+                        self.pool_cov_bv_ood.mul_(1.0 - rho_pool).add_(rho_pool * cov_bv)
+
+            w_ood_cond = self._get_ood_cond_warmup()
+            if w_ood_cond <= 0.0:
+                if not self.training:
+                    q_proj_eval = (v_d @ P_act).to(device=orig_dev, dtype=orig_dtype)
+                    return q_proj_eval, q_proj_eval
+                return q_m_ood, v_ood
+
+            w_sh = (
+                (self.sample_counts / (self.sample_counts + 20.0))
+                * self.pert_ood_init
+                * (1.0 - is_ctrl_s)
+            ).unsqueeze(-1)
+            mu_hat = (
+                w_sh[sample_idx]
+                * (self.pert_means_ood[sample_idx] - self.ctrl_mean_ood.unsqueeze(0))
+            ) @ P_act
+            r_within = ((v_d - self.ctrl_mean_ood.unsqueeze(0)) @ P_act) - mu_hat
+
+            eye_b = torch.eye(b_vec.shape[1], device=dev, dtype=torch.float32)
+            w_deleak = torch.linalg.solve(
+                self.pool_cov_bb_ood + 1e-4 * eye_b, self.pool_cov_bv_ood
+            )
+            db = b_vec - self.pool_mean_b_ood.unsqueeze(0)
+            r_within_orth = (r_within - (db @ w_deleak)) @ P_act
+            q_m_ood_clean = ((mu_hat + 0.52 * r_within_orth) @ P_act).to(
+                device=orig_dev, dtype=orig_dtype
+            )
+
+        if not self.training:
+            return q_m_ood_clean, q_m_ood_clean
+
+        P_act_t = P_act.to(device=orig_dev, dtype=orig_dtype)
+        q_m_proj = q_m_ood @ P_act_t
+        v_proj = v_ood @ P_act_t
+        q_m_ood_src = (1.0 - w_ood_cond) * q_m_ood + w_ood_cond * (
+            q_m_proj + (q_m_ood_clean - q_m_proj).detach()
+        )
+        v_ood_src = (1.0 - w_ood_cond) * v_ood + w_ood_cond * (
+            v_proj + (q_m_ood_clean - q_m_proj).detach()
+        )
+        return q_m_ood_src, v_ood_src
 
     # --- Exact Closed-Form Schur-Product Functional Prior ---
     def compute_film_prior_loss(
@@ -1044,17 +1468,30 @@ class SplitNaturalShiftFiLM(nn.Module):
             g_act, g_perp = self.get_snr_gates(ch)
             V_hat, U_hat = self.get_effective_bases(ch, g_act, g_perp)
 
-            C_v = V_hat @ Sigma_ref @ V_hat.T
-            G_U = U_hat.T @ U_hat
+            C_v = (V_hat @ Sigma_ref @ V_hat.T).detach()
+            G_U = (U_hat.T @ U_hat).detach()
 
-            gamma_par = getattr(self, f"gamma_par_{ch}")(e_gamma)
-            gamma_perp = getattr(self, f"gamma_perp_{ch}")(e_gamma)
-            alpha = getattr(self, f"alpha_{ch}")(e_alpha)
+            if ch == "cycle" and hasattr(self, "emb_gamma_cycle"):
+                eg_ch = self.emb_gamma_cycle(p_treat)
+                ea_ch = self.emb_alpha_cycle(p_treat)
+            else:
+                eg_ch = e_gamma
+                ea_ch = e_alpha
+
+            gamma_par = getattr(self, f"gamma_par_{ch}")(eg_ch)
+            gamma_perp = getattr(self, f"gamma_perp_{ch}")(eg_ch)
+            alpha = getattr(self, f"alpha_{ch}")(ea_ch)
+
+            w_p = 1.0
 
             diag_weights = (g_act.pow(2)) * torch.diagonal(Sigma_ref)
-            tan_energy = ((gamma_par.pow(2)) * diag_weights.unsqueeze(0)).sum()
-            perp_energy = ((gamma_perp @ (G_U * C_v)) * gamma_perp).sum()
-            alpha_energy = (alpha.pow(2)).sum()
+            tan_energy = (w_p * (gamma_par.pow(2)) * diag_weights.unsqueeze(0)).sum()
+            perp_energy = (w_p * ((gamma_perp @ (G_U * C_v)) * gamma_perp)).sum()
+            if ch == "state" and self.active_gate_ln:
+                w_alpha_dim = (1.0 + 6.0 * g_act.detach().pow(2)).unsqueeze(0)
+                alpha_energy = (w_p * w_alpha_dim * alpha.pow(2)).sum()
+            else:
+                alpha_energy = (w_p * alpha.pow(2)).sum()
 
             total_raw = total_raw + 0.5 * (
                 float(lg_c) * (tan_energy + perp_energy) + float(la_c) * alpha_energy
@@ -1116,12 +1553,26 @@ class BifurcatedDecoder(nn.Module):
         n_hidden_ood: int = 64,
         n_layers: int = 1,
         max_col_norm: Optional[float] = 2.0,
+        state_orth_max_col_norm: Optional[float] = None,
+        main_head_max_col_norm: Optional[float] = None,
+        ood_hidden_max_col_norm: Optional[float] = None,
+        use_expressive_cycle_shift: bool = False,
     ):
         super().__init__()
         self.n_latent_cycle = int(n_latent_cycle)
         self.n_latent_main = int(n_input - n_latent_cycle)
         self.n_genes = int(n_output)
         self.max_col_norm = max_col_norm
+        self.state_orth_max_col_norm = (
+            float(state_orth_max_col_norm) if state_orth_max_col_norm is not None else None
+        )
+        self.main_head_max_col_norm = (
+            float(main_head_max_col_norm) if main_head_max_col_norm is not None else None
+        )
+        self.ood_hidden_max_col_norm = (
+            float(ood_hidden_max_col_norm) if ood_hidden_max_col_norm is not None else None
+        )
+        self.use_expressive_cycle_shift = bool(use_expressive_cycle_shift)
         self.ood_max_col_norm = ood_max_col_norm
         self.decouple_batch_state = bool(decouple_batch_state)
         self.cycle_decoder_mode = str(cycle_decoder_mode)
@@ -1236,14 +1687,35 @@ class BifurcatedDecoder(nn.Module):
             )
 
         self.main_head = nn.Linear(n_hidden, self.n_genes)
+        if self.main_head_max_col_norm is not None and self.main_head_max_col_norm > 0.0:
+            eff_mh_col_norm = self.main_head_max_col_norm * max(
+                1.0, (float(self.n_genes) / 1000.0) ** 0.5
+            )
+            register_parametrization(
+                self.main_head,
+                "weight",
+                MaxColNorm(max_col_norm=eff_mh_col_norm),
+            )
         self.px_dropout_decoder = nn.Linear(n_hidden, self.n_genes)
 
         # --- Pathway C: Dedicated Quarantined OOD Head (when split_ood_decoder=True) ---
         if self.split_ood_decoder and self.n_latent_ood > 0:
             eff_ood_hid_col_norm = (
-                float(max_col_norm)
-                if (max_col_norm is not None and float(max_col_norm) > 0.0)
-                else (float(self.ood_max_col_norm) if (self.ood_max_col_norm is not None and float(self.ood_max_col_norm) > 0.0) else None)
+                self.ood_hidden_max_col_norm
+                if (self.ood_hidden_max_col_norm is not None and self.ood_hidden_max_col_norm > 0.0)
+                else (
+                    0.82
+                    if self.use_expressive_cycle_shift
+                    else (
+                        float(max_col_norm)
+                        if (max_col_norm is not None and float(max_col_norm) > 0.0)
+                        else (
+                            float(self.ood_max_col_norm)
+                            if (self.ood_max_col_norm is not None and float(self.ood_max_col_norm) > 0.0)
+                            else None
+                        )
+                    )
+                )
             )
             self.ood_hidden = nn.Sequential(
                 nn.Linear(self.n_latent_ood, int(n_hidden_ood), bias=False),
@@ -1266,14 +1738,48 @@ class BifurcatedDecoder(nn.Module):
                     MaxColNorm(max_col_norm=eff_ood_head_col_norm),
                 )
 
-    def compute_go_pathway_coordinates(self, cycle_latent: torch.Tensor) -> torch.Tensor:
+    def update_state_col_bounds(self, state_g_act: Optional[torch.Tensor], w_gate: float = 1.0) -> None:
+        """Dynamically updates per-column max norms on main_hidden[0] to close the bilinear scale gauge."""
+        if (
+            state_g_act is None
+            or self.state_orth_max_col_norm is None
+            or self.max_col_norm is None
+            or float(self.max_col_norm) <= 0.0
+        ):
+            return
+        lin0 = self.main_hidden[0]
+        if hasattr(lin0, "parametrizations") and "weight" in lin0.parametrizations:
+            g_a = state_g_act.detach().clamp(0.0, 1.0)
+            c_act = float(self.max_col_norm)
+            wg = float(min(1.0, max(0.0, w_gate)))
+            c_orth_warm = min(c_act, max(float(self.state_orth_max_col_norm), 1.40))
+            c_orth = (1.0 - wg) * c_orth_warm + wg * float(self.state_orth_max_col_norm)
+            col_bound = g_a * c_act + (1.0 - g_a) * c_orth
+            in_dim = int(lin0.in_features)
+            if in_dim > col_bound.numel():
+                pad = torch.full(
+                    (in_dim - col_bound.numel(),),
+                    c_act,
+                    device=col_bound.device,
+                    dtype=col_bound.dtype,
+                )
+                col_bound = torch.cat([col_bound, pad], dim=0)
+            elif in_dim < col_bound.numel():
+                col_bound = col_bound[:in_dim]
+            lin0.parametrizations.weight[0].set_col_max_vec(col_bound)
+
+    def compute_go_pathway_coordinates(
+        self, cycle_latent: torch.Tensor, expressive: bool = False
+    ) -> torch.Tensor:
         """Maps a 3D cycle latent (u_cycle_src or z_cycle) to K=6 explicit GO pathway coordinates."""
+        use_exp = bool(expressive) and (self.harmonic_basis_mode == "soft_unit_ribbon")
         phi = expand_cylindrical_harmonics(
             cycle_latent,
             harmonic_2theta_scale=self.harmonic_2theta_scale,
+            z2_scale=0.36 if use_exp else 0.05,
             r0_smooth=self.r0_smooth,
             radial_amp_scale=self.radial_amp_scale,
-            harmonic_basis_mode=self.harmonic_basis_mode,
+            harmonic_basis_mode="saturating_rational" if use_exp else self.harmonic_basis_mode,
         )
         if self.cycle_decoder_mode == "go_cylindrical" and self.has_pathway_mask:
             return self.cyl_to_go(phi)
@@ -1282,13 +1788,19 @@ class BifurcatedDecoder(nn.Module):
     def decode_cycle_logits(self, z_cycle: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Computes h_cycle and (if go_cylindrical) the K=6 GO pathway activations z_cycle_go."""
         cyc_mask_1d = self.cycle_gene_mask.float()
+        use_exp_dec = self.use_expressive_cycle_shift and (
+            self.harmonic_basis_mode == "soft_unit_ribbon"
+        )
+        dec_basis_mode = "saturating_rational" if use_exp_dec else self.harmonic_basis_mode
+        dec_z2_scale = 0.36 if use_exp_dec else 0.05
         if self.cycle_decoder_mode == "go_cylindrical" and self.has_pathway_mask:
             phi_cyl = expand_cylindrical_harmonics(
                 z_cycle,
                 harmonic_2theta_scale=self.harmonic_2theta_scale,
+                z2_scale=dec_z2_scale,
                 r0_smooth=self.r0_smooth,
                 radial_amp_scale=self.radial_amp_scale,
-                harmonic_basis_mode=self.harmonic_basis_mode,
+                harmonic_basis_mode=dec_basis_mode,
             )
             z_cycle_go = self.cyl_to_go(phi_cyl)
             M_path_t = self.pathway_mask.t().to(device=z_cycle.device, dtype=z_cycle.dtype)  # (G, K)
@@ -1304,9 +1816,10 @@ class BifurcatedDecoder(nn.Module):
             phi_cyl = expand_cylindrical_harmonics(
                 z_cycle,
                 harmonic_2theta_scale=self.harmonic_2theta_scale,
+                z2_scale=dec_z2_scale,
                 r0_smooth=self.r0_smooth,
                 radial_amp_scale=self.radial_amp_scale,
-                harmonic_basis_mode=self.harmonic_basis_mode,
+                harmonic_basis_mode=dec_basis_mode,
             )
             masked_cycle_weight = self.cycle_head.weight * cyc_mask_1d.unsqueeze(1)
             masked_cycle_bias = self.cycle_head.bias * cyc_mask_1d
@@ -1433,6 +1946,10 @@ class PertVI_Inference(nn.Module):
         n_obs_total: int = 1,
         sample_counts: Optional[torch.Tensor] = None,
         is_control_sample: Optional[torch.Tensor] = None,
+        max_active_basal_dims: Optional[int] = None,
+        active_gate_ln: bool = False,
+        deleak_basal_state: bool = False,
+        state_orth_max_shift_norm: Optional[float] = None,
     ):
         super().__init__()
         if transition_mode is not None:
@@ -1561,6 +2078,11 @@ class PertVI_Inference(nn.Module):
             n_obs_total=n_obs_total,
             sample_counts=sample_counts,
             is_control_sample=is_control_sample,
+            max_active_basal_dims=max_active_basal_dims,
+            active_gate_ln=active_gate_ln,
+            deleak_basal_state=deleak_basal_state,
+            state_orth_max_shift_norm=state_orth_max_shift_norm,
+            u_ood_dim=n_latent_ood,
         )
 
         # --- The OOD dropout ---
@@ -1636,6 +2158,7 @@ class PertVI_Inference(nn.Module):
             )
             z_base = torch.cat([z_cycle, z_state], dim=-1)
             z_shift = z_base - u_base
+            q_m_ood_src, v_ood_src = q_m_ood, v_ood
         else:
             z_cycle, z_state, u_cycle_src, u_state_src = self.split_film_transition(
                 u_cycle,
@@ -1650,10 +2173,20 @@ class PertVI_Inference(nn.Module):
             )
             z_base = torch.cat([z_cycle, z_state], dim=-1)
             z_shift = z_base - torch.cat([u_cycle_src, u_state_src], dim=-1)
+            q_m_ood_src, v_ood_src = self.split_film_transition.condition_ood_latent(
+                q_m_ood=q_m_ood,
+                v_ood=v_ood,
+                u_cycle_src=u_cycle_src,
+                u_state_src=u_state_src,
+                sample_or_embed=sample_index,
+                w_enc_ood=self.encoder_ood.mean_encoder.weight,
+                is_treated=is_treated,
+                u_cycle_go_enc=u_cycle_go_enc,
+            )
 
-        # Composition with Information Dropout on OOD (deterministic q_m_ood in eval mode)
-        v_ood_dropped = self.ood_dropout(v_ood)
-        v_ood_for_z = v_ood_dropped if self.training else q_m_ood
+        # Composition with Information Dropout on OOD (deterministic q_m_ood_src in eval mode)
+        v_ood_dropped = self.ood_dropout(v_ood_src)
+        v_ood_for_z = v_ood_dropped if self.training else q_m_ood_src
 
         # Final composition
         z_final = torch.cat([z_base, v_ood_for_z], dim=-1)
@@ -1673,6 +2206,7 @@ class PertVI_Inference(nn.Module):
             "u_cycle_src": u_cycle_src,
             "u_state_src": u_state_src,
             "v_ood": v_ood,
+            "q_m_ood_src": q_m_ood_src,
             "q_m_cycle": q_m_cycle,
             "q_v_cycle": q_v_cycle,
             "q_m_state": q_m_state,

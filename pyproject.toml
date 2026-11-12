@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pertvi"
-version = "0.4.2"
+version = "0.4.3"
 description = "PertVI: Disentangled Multi-resolution Variational Inference with GO Pathway-Masked Cell-Cycle Encoder"
 dependencies = [
     "torch>=2.0",

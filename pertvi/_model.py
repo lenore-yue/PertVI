@@ -66,14 +66,43 @@ class PertVITrainingPlan(TrainingPlan):
         else:
             return max_weight
 
+    def _compute_early_adv_weight(self, max_weight, start_frac=0.55):
+        epoch = float(self.current_epoch)
+        start_ep = float(self.warmup_epochs) * float(start_frac)
+        end_ep = float(self.warmup_epochs + self.anneal_epochs)
+        if epoch < start_ep:
+            return 0.0
+        elif epoch < end_ep:
+            progress = (epoch - start_ep) / max(1.0, end_ep - start_ep)
+            return max_weight * progress
+        else:
+            return max_weight
+
     def training_step(self, batch, batch_idx):
         current_lambda_adv_state = self._compute_standard_weight(self.max_lambda_adv_state)
-        current_lambda_adv_ood = self._compute_standard_weight(self.max_lambda_adv_ood)
+        if getattr(self.module, "active_gate_ln", False):
+            current_lambda_adv_ood = self._compute_early_adv_weight(self.max_lambda_adv_ood, start_frac=0.55)
+        else:
+            current_lambda_adv_ood = self._compute_standard_weight(self.max_lambda_adv_ood)
         current_lambda_ood = self._compute_floor_weight(self.floor_lambda_ood, self.max_lambda_ood)
 
         self.module.current_lambda_adv_state = current_lambda_adv_state
         self.module.current_lambda_adv_ood = current_lambda_adv_ood
         self.module.current_lambda_ood = current_lambda_ood
+
+        film_tr = getattr(
+            getattr(self.module, "inference_net", None), "split_film_transition", None
+        )
+        if film_tr is not None and hasattr(film_tr, "set_kl_warmup_progress"):
+            total_ep = float(getattr(self.trainer, "max_epochs", 120) or 120)
+            gate_end_ep = max(1.0, min(float(self.warmup_epochs) * 0.75, 0.22 * total_ep))
+            n_batches = float(getattr(self.trainer, "num_training_batches", 1) or 1)
+            if (not np.isfinite(n_batches)) or n_batches < 1.0:
+                n_batches = 1.0
+            ep_cont = float(self.current_epoch) + float(batch_idx) / n_batches
+            film_tr.set_kl_warmup_progress(
+                ep_cont / gate_end_ep, train_progress=ep_cont / max(1.0, total_ep)
+            )
 
         return super().training_step(batch, batch_idx)
 
@@ -88,6 +117,7 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
     _loading_legacy_ckpt: bool = False
     _loading_v040_ckpt: bool = False
     _loading_legacy_cyl_ckpt: bool = False
+    _loading_v042_ckpt: bool = False
 
     def __init__(
         self,
@@ -109,8 +139,8 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         selective_cycle_input: Optional[bool] = None,
         ood_all_cells_hsic: Optional[bool] = None,
         within_pert_hsic_weight: Optional[float] = None,
-        lambda_film_gamma: float = 1.5,
-        lambda_film_alpha: float = 1.0,
+        lambda_film_gamma: Optional[float] = None,
+        lambda_film_alpha: Optional[float] = None,
         basal_gene_dropout_rate: Union[float, str] = "auto",
         ood_sub_dropout_rate: Optional[float] = None,
         ood_dropout_rate: Optional[float] = None,
@@ -129,10 +159,27 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         lambda_drug_cycle_align: Optional[float] = None,
         lambda_go_pathway: float = 2.5,
         lambda_ribbon_2d: float = 25.0,
+        max_active_basal_dims: Optional[int] = None,
+        active_gate_ln: Optional[bool] = None,
+        deleak_basal_state: Optional[bool] = None,
+        state_orth_max_col_norm: Optional[float] = None,
+        state_orth_max_shift_norm: Optional[float] = None,
+        main_head_max_col_norm: Optional[float] = None,
+        ood_hidden_max_col_norm: Optional[float] = None,
+        ood_treated_l1: Optional[float] = None,
+        beta_state_orth: Optional[float] = None,
+        lambda_pert_state: Optional[float] = None,
+        lambda_w_orth: Optional[float] = None,
         **model_kwargs,
     ):
         super().__init__(adata)
 
+        is_any_old_ckpt = (
+            getattr(self.__class__, "_loading_legacy_ckpt", False)
+            or getattr(self.__class__, "_loading_v040_ckpt", False)
+            or getattr(self.__class__, "_loading_legacy_cyl_ckpt", False)
+            or getattr(self.__class__, "_loading_v042_ckpt", False)
+        )
         if getattr(self.__class__, "_loading_legacy_ckpt", False):
             film_mode = "legacy_hadamard"
             cycle_encoder_mode = "standard"
@@ -159,6 +206,17 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             model_kwargs = dict(model_kwargs)
             model_kwargs.setdefault("ood_max_col_norm", None)
             model_kwargs.setdefault("decouple_batch_state", False)
+        if is_any_old_ckpt:
+            if active_gate_ln is None:
+                active_gate_ln = False
+            if deleak_basal_state is None:
+                deleak_basal_state = False
+            if beta_state_orth is None:
+                beta_state_orth = 0.0
+            if lambda_pert_state is None:
+                lambda_pert_state = 0.0
+            if lambda_w_orth is None:
+                lambda_w_orth = 0.0
 
         if cycle_gene_mask_key not in adata.var.columns:
             raise ValueError(f"Column '{cycle_gene_mask_key}' not found in adata.var.")
@@ -237,30 +295,66 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             within_pert_hsic_weight = 0.0
         if ood_sub_dropout_rate is None:
             ood_sub_dropout_rate = 0.05 if use_go_arch else 0.0
+        use_v043_expressive = (
+            (use_go_arch or bool(split_ood_decoder))
+            and (film_mode == "m7_block_tt")
+            and (not is_any_old_ckpt)
+        )
+        if active_gate_ln is None:
+            active_gate_ln = True if use_v043_expressive else False
         if ood_dropout_rate is None:
-            ood_dropout_rate = 0.0 if use_go_arch else 0.3
+            ood_dropout_rate = 0.04 if use_v043_expressive else (0.0 if use_go_arch else 0.3)
         if ortho_mode is None:
             ortho_mode = "snr_harmonic_hsic" if use_go_arch else "linear_cov"
         if ood_anchor_mode is None:
             ood_anchor_mode = "l2" if use_go_arch else "l1"
         if max_lambda_adv_state is None:
-            max_lambda_adv_state = 160.0 if use_go_arch else 100.0
+            max_lambda_adv_state = (120.0 if use_v043_expressive else 160.0) if use_go_arch else 100.0
         if max_lambda_adv_ood is None:
-            max_lambda_adv_ood = 120.0 if use_go_arch else 5.0
+            max_lambda_adv_ood = (185.0 if use_v043_expressive else 135.0) if use_go_arch else 5.0
         if lambda_soft is None:
             lambda_soft = 150.0 if use_go_arch else 50.0
         if floor_lambda_ood is None:
-            floor_lambda_ood = 12.0 if use_go_arch else 5.0
+            floor_lambda_ood = (1.45 if active_gate_ln else 12.0) if use_go_arch else 5.0
         if max_lambda_ood is None:
-            max_lambda_ood = 140.0 if use_go_arch else 50.0
+            max_lambda_ood = (10.5 if active_gate_ln else 140.0) if use_go_arch else 50.0
         if beta_cyc is None:
             beta_cyc = 0.30 if use_go_arch else 0.50
         if sigma_cycle_z is None:
             sigma_cycle_z = 0.03 if use_go_arch else 0.05
         if harmonic_basis_mode is None:
             harmonic_basis_mode = "soft_unit_ribbon"
+
+        if deleak_basal_state is None:
+            deleak_basal_state = True if use_v043_expressive else False
+        if max_active_basal_dims is None and use_v043_expressive:
+            max_active_basal_dims = min(10, max(1, int(n_latent_state) - 4))
+        if state_orth_max_col_norm is None and use_v043_expressive:
+            state_orth_max_col_norm = 0.42
+        if state_orth_max_shift_norm is None and use_v043_expressive:
+            state_orth_max_shift_norm = 5.70
+        if ood_hidden_max_col_norm is None and use_v043_expressive:
+            ood_hidden_max_col_norm = 0.72
+        if ood_treated_l1 is None:
+            ood_treated_l1 = 0.0
+        if beta_state_orth is None:
+            beta_state_orth = 0.40 if use_v043_expressive else 0.0
+        if lambda_pert_state is None:
+            lambda_pert_state = 0.20 if use_v043_expressive else 0.0
+        if lambda_w_orth is None:
+            lambda_w_orth = 0.025 if use_v043_expressive else 0.0
+        if lambda_film_gamma is None:
+            lambda_film_gamma = 0.0036 if use_v043_expressive else 1.5
+        if lambda_film_alpha is None:
+            lambda_film_alpha = 0.0165 if use_v043_expressive else 1.0
         if lambda_drug_cycle_align is None:
-            lambda_drug_cycle_align = 0.0
+            lambda_drug_cycle_align = 22.0 if (use_go_arch and active_gate_ln) else 0.0
+        if use_v043_expressive:
+            model_kwargs = dict(model_kwargs)
+            model_kwargs.setdefault("drug_embed_dim", 32)
+            model_kwargs.setdefault("rank_gamma", min(20, int(n_latent_state)))
+            if split_ood_decoder:
+                model_kwargs.setdefault("lambda_batch_state", 3.5)
 
         self.module = PertVIModule(
             n_input=self.summary_stats.n_vars,
@@ -307,10 +401,21 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
             lambda_drug_cycle_align=lambda_drug_cycle_align,
             lambda_go_pathway=lambda_go_pathway if use_go_arch else 0.0,
             lambda_ribbon_2d=lambda_ribbon_2d if use_go_arch else 0.0,
+            max_active_basal_dims=max_active_basal_dims,
+            active_gate_ln=active_gate_ln,
+            deleak_basal_state=deleak_basal_state,
+            state_orth_max_col_norm=state_orth_max_col_norm,
+            state_orth_max_shift_norm=state_orth_max_shift_norm,
+            main_head_max_col_norm=main_head_max_col_norm,
+            ood_hidden_max_col_norm=ood_hidden_max_col_norm,
+            ood_treated_l1=ood_treated_l1,
+            beta_state_orth=beta_state_orth,
+            lambda_pert_state=lambda_pert_state,
+            lambda_w_orth=lambda_w_orth,
             **model_kwargs,
         )
         self._model_summary_string = (
-            "Disentangled Multi-resolution Variational Inference with GO Pathway-Masked Cell-Cycle Encoder (v0.4.2)."
+            "Disentangled Multi-resolution Variational Inference with GO Pathway-Masked Cell-Cycle Encoder (v0.4.3)."
         )
         self.init_params_ = self._get_init_params(locals())
 
@@ -328,20 +433,27 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
         is_legacy = False
         is_v040 = False
         is_legacy_cyl = False
+        is_v042 = False
         if os.path.exists(pt_path):
             ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
             sd = ckpt.get("model_state_dict", {})
+            attr_d = ckpt.get("attr_dict", {})
+            summary_str = str(attr_d.get("_model_summary_string", ""))
+            non_kw = attr_d.get("init_params_", {}).get("non_kwargs", {})
             if "inference_net.split_film_transition.gamma_state.bias" in sd:
                 is_legacy = True
             elif "inference_net.encoder_cycle.pathway_linear.weight" not in sd:
                 is_v040 = True
             elif "generative_net.cyl_to_go.bias" in sd:
                 is_legacy_cyl = True
+            elif ("v0.4.2" in summary_str) or ("active_gate_ln" not in non_kw):
+                is_v042 = True
         cls._loading_legacy_ckpt = is_legacy
         cls._loading_v040_ckpt = is_v040
         cls._loading_legacy_cyl_ckpt = is_legacy_cyl
+        cls._loading_v042_ckpt = is_v042
         try:
-            return super().load(
+            loaded = super().load(
                 dir_path,
                 adata=adata,
                 accelerator=accelerator,
@@ -349,10 +461,17 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
                 prefix=prefix,
                 **kwargs,
             )
+            film_m = getattr(loaded.module.inference_net, "split_film_transition", None)
+            if film_m is not None and getattr(film_m, "film_mode", "") == "m7_block_tt":
+                loaded.module.generative_net.update_state_col_bounds(
+                    film_m.get_snr_gates("state")[0]
+                )
+            return loaded
         finally:
             cls._loading_legacy_ckpt = False
             cls._loading_v040_ckpt = False
             cls._loading_legacy_cyl_ckpt = False
+            cls._loading_v042_ckpt = False
 
     @classmethod
     def setup_anndata(
@@ -602,8 +721,18 @@ class PertVI(RNASeqMixin, VAEMixin, BaseModelClass):
                 outputs = self.module.inference(**inference_inputs)
 
                 latent_spaces["u_cycle"].append(outputs["q_m_cycle"].cpu().numpy())
-                latent_spaces["u_state"].append(outputs["q_m_state"].cpu().numpy())
-                latent_spaces["v_ood"].append(outputs["q_m_ood"].cpu().numpy())
+                u_st_out = (
+                    outputs["u_state_src"]
+                    if getattr(self.module, "active_gate_ln", False)
+                    else outputs["q_m_state"]
+                )
+                latent_spaces["u_state"].append(u_st_out.cpu().numpy())
+                v_ood_out = (
+                    outputs["q_m_ood_src"]
+                    if (getattr(self.module, "active_gate_ln", False) and "q_m_ood_src" in outputs)
+                    else outputs["q_m_ood"]
+                )
+                latent_spaces["v_ood"].append(v_ood_out.cpu().numpy())
                 latent_spaces["u_cycle_src"].append(outputs["u_cycle_src"].cpu().numpy())
                 latent_spaces["u_state_src"].append(outputs["u_state_src"].cpu().numpy())
 
