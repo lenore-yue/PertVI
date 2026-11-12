@@ -1,5 +1,11 @@
 # PertVI: Disentangled Variational Inference for Perturbation Response
 
+[![PyPI version](https://img.shields.io/badge/pypi-v0.3.0-blue.svg)](https://pypi.org)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-brightgreen.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-orange.svg)](https://pytorch.org/)
+[![scvi-tools](https://img.shields.io/badge/built%20with-scvi--tools-purple.svg)](https://scvi-tools.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 ![PertVI architecture](assets/architecture.svg)
 
 ## Introduction
